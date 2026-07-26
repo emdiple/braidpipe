@@ -6,3 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+braidpipe-core.workspace = true
+gstreamer.workspace = true
+gstreamer-app.workspace = true
+tracing.workspace = true
