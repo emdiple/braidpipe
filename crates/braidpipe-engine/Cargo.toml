@@ -10,3 +10,9 @@ braidpipe-core.workspace = true
 gstreamer.workspace = true
 gstreamer-app.workspace = true
 tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+dispatch = "0.2"
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"

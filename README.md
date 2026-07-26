@@ -81,7 +81,7 @@ cargo run -p braidpipe --release -- \
 
 ### URI inputs
 
-Use `--uri` to select a GStreamer source for a URI and decode it with `uridecodebin3` before it enters the processing pipeline:
+Use `--uri` to select and decode a GStreamer source before it enters the processing pipeline. SRT inputs use `srtsrc ! decodebin3`; other URI schemes use `uridecodebin3`.
 
 ```bash
 cargo run -p braidpipe --release -- \

@@ -78,6 +78,15 @@ impl GStreamerEngine {
             ));
         }
 
+        if uri
+            .get(..6)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("srt://"))
+        {
+            return Ok(format!(
+                "srtsrc uri=\"{uri}\" ! queue ! decodebin3 name=decoder decoder. ! queue ! video/x-raw ! videoconvert"
+            ));
+        }
+
         Ok(format!(
             "uridecodebin3 uri=\"{uri}\" name=decoder decoder. ! queue ! video/x-raw ! videoconvert"
         ))
@@ -106,12 +115,21 @@ mod tests {
     use super::GStreamerEngine;
 
     #[test]
-    fn creates_a_decodebin3_pipeline_for_uris() {
+    fn creates_a_decodebin3_pipeline_for_srt_uris() {
         let pipeline = GStreamerEngine::uri_source_pipeline("srt://127.0.0.1:9000")
             .expect("valid URI should build a source pipeline");
 
-        assert!(pipeline.contains("uridecodebin3"));
+        assert!(pipeline.contains("srtsrc"));
+        assert!(pipeline.contains("decodebin3"));
         assert!(pipeline.contains("uri=\"srt://127.0.0.1:9000\""));
+    }
+
+    #[test]
+    fn creates_a_uri_decoder_pipeline_for_non_srt_uris() {
+        let pipeline = GStreamerEngine::uri_source_pipeline("ndi://Studio%20Camera")
+            .expect("valid URI should build a source pipeline");
+
+        assert!(pipeline.contains("uridecodebin3"));
     }
 
     #[test]

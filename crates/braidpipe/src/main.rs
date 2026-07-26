@@ -62,8 +62,18 @@ struct Args {
     passthrough_only: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+type AppError = Box<dyn std::error::Error + Send + Sync>;
+
+fn main() -> Result<(), AppError> {
+    braidpipe_engine::gst_mac::run(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(run())
+    })
+}
+
+async fn run() -> Result<(), AppError> {
     // 1. Initialize structured log output with RUST_LOG filter support
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -78,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Constructing GStreamer dual-branch pipeline...");
     let engine = Arc::new(match args.uri.as_deref() {
         Some(uri) => {
-            info!(%uri, "Creating pipeline from input URI with uridecodebin3");
+            info!(%uri, "Creating pipeline from input URI");
             GStreamerEngine::new_from_uri(uri, &args.sink)?
         }
         None => GStreamerEngine::new(args.source.as_deref().unwrap_or(DEFAULT_SOURCE), &args.sink)?,
