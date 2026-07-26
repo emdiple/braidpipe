@@ -1,5 +1,3 @@
-use async_trait::async_trait;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveBranch {
     Passthrough,
@@ -17,7 +15,6 @@ pub enum EngineError {
 }
 
 /// The core Watchdog will call this trait without needing to know GStreamer exists.
-#[async_trait]
 pub trait StreamController: Send + Sync {
     /// Flips the GStreamer input-selector to Passthrough or AI
     async fn set_active_branch(&self, branch: ActiveBranch) -> Result<(), EngineError>;
