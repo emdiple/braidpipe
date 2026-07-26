@@ -27,6 +27,7 @@ pub trait ShmWriter: Send + Sync {
 }
 
 /// The abstraction for IPC signaling and Watchdog monitoring with Python
+#[allow(async_fn_in_trait)]
 pub trait AiBridge: Send + Sync {
     /// Sends a frame notification to Python over the UDS control channel
     async fn notify_frame_ready(&self, meta: FrameMetadata) -> Result<(), IpcError>;

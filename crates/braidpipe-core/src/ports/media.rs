@@ -15,10 +15,11 @@ pub enum EngineError {
 }
 
 /// The core Watchdog will call this trait without needing to know GStreamer exists.
+#[allow(async_fn_in_trait)]
 pub trait StreamController: Send + Sync {
     /// Flips the GStreamer input-selector to Passthrough or AI
     async fn set_active_branch(&self, branch: ActiveBranch) -> Result<(), EngineError>;
-    
+
     /// Returns the current active branch
     fn current_branch(&self) -> ActiveBranch;
 

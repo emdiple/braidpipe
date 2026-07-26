@@ -1,4 +1,5 @@
 use braidpipe_core::fsm::Watchdog;
+use braidpipe_core::ports::media::StreamController;
 use braidpipe_engine::pipeline::GStreamerEngine;
 use braidpipe_ipc::shm::ShmRingBuffer;
 use braidpipe_ipc::uds::UdsControlBridge;
@@ -6,22 +7,26 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::process::Command;
+use tokio::signal;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+const DEFAULT_SOURCE: &str =
+    "videotestsrc pattern=ball ! video/x-raw,width=1280,height=720,framerate=30/1 ! videoconvert";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Zero-downtime AI video middleware daemon", long_about = None)]
 struct Args {
-    /// GStreamer source string (e.g., "videotestsrc pattern=ball ! video/x-raw,width=1920,height=1080")
-    #[arg(
-        short,
-        long,
-        default_value = "videotestsrc pattern=ball ! video/x-raw,width=1280,height=720,framerate=30/1 ! videoconvert"
-    )]
-    source: String,
+    /// GStreamer source string for inputs requiring a custom launch pipeline
+    #[arg(short = 'i', long, conflicts_with = "uri")]
+    source: Option<String>,
+
+    /// Input URI decoded by GStreamer's uridecodebin3 (for example: srt://, udp://, rtp://, or ndi://)
+    #[arg(long, value_name = "URI", conflicts_with = "source")]
+    uri: Option<String>,
 
     /// GStreamer sink string (e.g., "autovideosink" or "srtsink uri=srt://127.0.0.1:8888")
-    #[arg(short, long, default_value = "videoconvert ! autovideosink")]
+    #[arg(short = 'o', long, default_value = "videoconvert ! autovideosink")]
     sink: String,
 
     /// Path to the Python worker script or virtualenv executable
@@ -51,6 +56,10 @@ struct Args {
     /// Socket path for Python UDS listener
     #[arg(long, default_value = "/tmp/braidpipe_python.sock")]
     python_sock: String,
+
+    /// Keep the stream on the passthrough branch without starting the Python worker
+    #[arg(long)]
+    passthrough_only: bool,
 }
 
 #[tokio::main]
@@ -67,7 +76,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Initialize the Media Engine Adapter (GStreamer)
     info!("Constructing GStreamer dual-branch pipeline...");
-    let engine = Arc::new(GStreamerEngine::new(&args.source, &args.sink)?);
+    let engine = Arc::new(match args.uri.as_deref() {
+        Some(uri) => {
+            info!(%uri, "Creating pipeline from input URI with uridecodebin3");
+            GStreamerEngine::new_from_uri(uri, &args.sink)?
+        }
+        None => GStreamerEngine::new(args.source.as_deref().unwrap_or(DEFAULT_SOURCE), &args.sink)?,
+    });
+
+    if args.passthrough_only {
+        info!("Starting in passthrough-only mode");
+        engine.start().await?;
+        signal::ctrl_c().await?;
+        engine.stop().await?;
+        return Ok(());
+    }
 
     // 3. Initialize Shared Memory Ring Buffer (/dev/shm)
     info!(

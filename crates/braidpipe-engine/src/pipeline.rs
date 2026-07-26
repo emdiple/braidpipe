@@ -23,7 +23,7 @@ impl GStreamerEngine {
         let pipe_desc = format!(
             "{} ! tee name=t \
              t. ! queue name=q_pass ! sel.sink_0 \
-             t. ! queue name=q_ai ! appsink name=ai_sink \
+             t. ! queue name=q_ai ! appsink name=ai_sink max-buffers=1 drop=true \
              appsrc name=ai_src ! sel.sink_1 \
              input-selector name=sel ! {}",
             source_pipeline, sink_pipeline
@@ -59,6 +59,30 @@ impl GStreamerEngine {
         })
     }
 
+    /// Builds a video source from a URI using GStreamer's URI source selection and decodebin3.
+    pub fn new_from_uri(uri: &str, sink_pipeline: &str) -> Result<Self, EngineError> {
+        let source_pipeline = Self::uri_source_pipeline(uri)?;
+        Self::new(&source_pipeline, sink_pipeline)
+    }
+
+    fn uri_source_pipeline(uri: &str) -> Result<String, EngineError> {
+        if uri.trim().is_empty() || !uri.contains("://") {
+            return Err(EngineError::BuildFailed(
+                "Input URI must include a scheme, such as srt://, udp://, rtp://, or ndi://".into(),
+            ));
+        }
+
+        if uri.contains(['"', '\\']) {
+            return Err(EngineError::BuildFailed(
+                "Input URI cannot contain quotes or backslashes".into(),
+            ));
+        }
+
+        Ok(format!(
+            "uridecodebin3 uri=\"{uri}\" name=decoder decoder. ! queue ! video/x-raw ! videoconvert"
+        ))
+    }
+
     /// Accessors for the IPC layer to hook into AppSink and AppSrc
     pub fn get_ai_sink(&self) -> Result<AppSink, EngineError> {
         self.pipeline
@@ -74,6 +98,25 @@ impl GStreamerEngine {
             .ok_or_else(|| EngineError::BuildFailed("Missing ai_src".into()))?
             .downcast::<AppSrc>()
             .map_err(|_| EngineError::BuildFailed("Invalid AppSrc".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GStreamerEngine;
+
+    #[test]
+    fn creates_a_decodebin3_pipeline_for_uris() {
+        let pipeline = GStreamerEngine::uri_source_pipeline("srt://127.0.0.1:9000")
+            .expect("valid URI should build a source pipeline");
+
+        assert!(pipeline.contains("uridecodebin3"));
+        assert!(pipeline.contains("uri=\"srt://127.0.0.1:9000\""));
+    }
+
+    #[test]
+    fn rejects_uris_without_a_scheme() {
+        assert!(GStreamerEngine::uri_source_pipeline("127.0.0.1:9000").is_err());
     }
 }
 
