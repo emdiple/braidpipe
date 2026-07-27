@@ -123,7 +123,9 @@ def run_worker(rust_sock_path: str, python_sock_path: str):
             # 4. Mark slot state as FREE for Rust reuse
             shm_mgr.mark_slot_free(slot_idx)
             
-            # 5. Send acknowledgment packet back to Rust Watchdog
+            # 5. Send acknowledgment packet back to Rust Watchdog.
+            # A full socket buffer (ENOBUFS) just means Rust is not draining
+            # acks right now; drop this ack instead of crashing the worker.
             elapsed_us = (time.perf_counter_ns() - start_time) // 1000
             ack_packet = {
                 "frame_id": frame_id,
@@ -131,7 +133,10 @@ def run_worker(rust_sock_path: str, python_sock_path: str):
                 "processing_time_us": elapsed_us,
                 "success": True,
             }
-            sock.sendto(json.dumps(ack_packet).encode("utf-8"), rust_sock_path)
+            try:
+                sock.sendto(json.dumps(ack_packet).encode("utf-8"), rust_sock_path)
+            except OSError as exc:
+                print(f"[Text Worker] Dropped ack for frame {frame_id}: {exc}")
             
     except KeyboardInterrupt:
         print("[Text Worker] Shutting down cleanly...")
