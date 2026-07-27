@@ -1,4 +1,4 @@
-# braidpipe
+# Braidpipe
 
 **Never-dark AI video middleware.** braidpipe ingests a live video stream, hands raw frames to a Python process for AI/CV work over shared memory, re-encodes the result, and streams it out — and if that Python process crashes, stalls, or falls behind, the output stream keeps running on untouched frames instead of going dark.
 
@@ -27,21 +27,23 @@ The `input-selector` decides, frame by frame, whether the viewer sees the AI bra
 
 ## Table of contents
 
-- [How the failover works](#how-the-failover-works)
-- [Requirements](#requirements)
-- [Install](#install)
-- [Quick start](#quick-start)
-- [Real-world pipelines](#real-world-pipelines)
-- [Command-line reference](#command-line-reference)
-- [Writing a Python worker](#writing-a-python-worker)
-- [The IPC contract](#the-ipc-contract)
-- [Testing failover](#testing-failover)
-- [Troubleshooting](#troubleshooting)
-- [Project layout](#project-layout)
-- [Development](#development)
-- [Known limitations](#known-limitations)
-- [Contributing](#contributing)
-- [License](#license)
+- [Braidpipe](#braidpipe)
+  - [Table of contents](#table-of-contents)
+  - [How the failover works](#how-the-failover-works)
+  - [Requirements](#requirements)
+  - [Install](#install)
+  - [Quick start](#quick-start)
+  - [Real-world pipelines](#real-world-pipelines)
+  - [Command-line reference](#command-line-reference)
+  - [Writing a Python worker](#writing-a-python-worker)
+  - [The IPC contract](#the-ipc-contract)
+  - [Testing failover](#testing-failover)
+  - [Troubleshooting](#troubleshooting)
+  - [Project layout](#project-layout)
+  - [Development](#development)
+  - [Known limitations](#known-limitations)
+  - [Contributing](#contributing)
+  - [License](#license)
 
 ## How the failover works
 
