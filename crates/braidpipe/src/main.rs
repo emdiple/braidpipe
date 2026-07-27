@@ -1,10 +1,12 @@
+mod relay;
+
 use braidpipe_core::fsm::Watchdog;
 use braidpipe_core::ports::media::StreamController;
 use braidpipe_engine::pipeline::GStreamerEngine;
 use braidpipe_ipc::shm::ShmRingBuffer;
 use braidpipe_ipc::uds::UdsControlBridge;
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::signal;
@@ -12,7 +14,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_SOURCE: &str =
-    "videotestsrc pattern=ball ! video/x-raw,width=1280,height=720,framerate=30/1 ! videoconvert";
+    "videotestsrc is-live=true pattern=ball ! video/x-raw,width=1280,height=720,framerate=30/1 ! videoconvert";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Zero-downtime AI video middleware daemon", long_about = None)]
@@ -108,7 +110,7 @@ async fn run() -> Result<(), AppError> {
         resolution = %format!("{}x{}", args.width, args.height),
         "Allocating POSIX Shared Memory ring buffer..."
     );
-    let _shm_buffer = Arc::new(ShmRingBuffer::create(
+    let shm_buffer = Arc::new(ShmRingBuffer::create(
         &args.shm_name,
         args.width,
         args.height,
@@ -120,9 +122,26 @@ async fn run() -> Result<(), AppError> {
     info!("Binding UDS control channels...");
     let ai_bridge = Arc::new(UdsControlBridge::bind(&args.rust_sock, &args.python_sock).await?);
 
-    // 5. Spawn the Python Worker Subprocess (Supervisor Pattern)
-    info!(path = ?args.python_script, "Spawning Python worker subprocess...");
-    let mut python_child = Command::new("python3")
+    // 5. Attach the frame relay: appsink -> SHM -> Python -> appsrc
+    relay::spawn(
+        engine.get_ai_sink()?,
+        engine.get_ai_src()?,
+        Arc::clone(&shm_buffer),
+        Arc::clone(&ai_bridge),
+        args.width,
+        args.height,
+        args.fps,
+    );
+
+    // 6. Spawn the Python Worker Subprocess (Supervisor Pattern)
+    // Prefer the project virtualenv so cv2/numpy are importable.
+    let python_exe = if Path::new(".venv/bin/python3").exists() {
+        ".venv/bin/python3"
+    } else {
+        "python3"
+    };
+    info!(python = python_exe, path = ?args.python_script, "Spawning Python worker subprocess...");
+    let mut python_child = Command::new(python_exe)
         .arg(&args.python_script)
         .spawn()
         .map_err(|e| format!("Failed to execute Python worker: {e}"))?;
@@ -130,10 +149,10 @@ async fn run() -> Result<(), AppError> {
     let child_pid = python_child.id().unwrap_or(0);
     info!(pid = child_pid, "Python worker active");
 
-    // 6. Instantiate the Watchdog FSM with injected Adapters
+    // 7. Instantiate the Watchdog FSM with injected Adapters
     let mut watchdog = Watchdog::new(engine, ai_bridge, args.fps);
 
-    // 7. Spawn a background thread to supervise the Python process handle
+    // 8. Spawn a background task to supervise the Python process handle
     tokio::spawn(async move {
         match python_child.wait().await {
             Ok(status) => warn!(status = %status, "Python worker process exited"),
@@ -141,7 +160,7 @@ async fn run() -> Result<(), AppError> {
         }
     });
 
-    // 8. Hand execution to the Watchdog event loop (Blocks until SIGINT/SIGTERM)
+    // 9. Hand execution to the Watchdog event loop (Blocks until SIGINT/SIGTERM)
     info!("System initialized. Handing off execution to Watchdog FSM...");
     watchdog.run_loop().await;
 

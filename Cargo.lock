@@ -96,6 +96,8 @@ dependencies = [
  "braidpipe-engine",
  "braidpipe-ipc",
  "clap",
+ "gstreamer",
+ "gstreamer-app",
  "thiserror",
  "tokio",
  "tracing",
