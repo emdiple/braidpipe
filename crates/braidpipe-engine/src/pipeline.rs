@@ -3,7 +3,7 @@ use gstreamer::prelude::*;
 use gstreamer_app::{AppSink, AppSrc};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::info;
+use tracing::{error, info, warn};
 
 pub struct GStreamerEngine {
     pipeline: gstreamer::Pipeline,
@@ -19,13 +19,16 @@ impl GStreamerEngine {
     pub fn new(source_pipeline: &str, sink_pipeline: &str) -> Result<Self, EngineError> {
         gstreamer::init().map_err(|e| EngineError::BuildFailed(e.to_string()))?;
 
-        // Pipeline description string using GStreamer launch syntax for construction
+        // Pipeline description string using GStreamer launch syntax.
+        // q_pass is leaky so that, while the AI branch is selected, buffers
+        // piling up on the inactive passthrough pad can never block the tee
+        // and stall the whole pipeline.
         let pipe_desc = format!(
             "{} ! tee name=t \
-             t. ! queue name=q_pass ! sel.sink_0 \
-             t. ! queue name=q_ai ! appsink name=ai_sink max-buffers=1 drop=true \
-             appsrc name=ai_src ! sel.sink_1 \
-             input-selector name=sel ! {}",
+             t. ! queue name=q_pass leaky=downstream max-size-buffers=3 ! sel.sink_0 \
+             t. ! queue name=q_ai leaky=downstream max-size-buffers=3 ! appsink name=ai_sink sync=false max-buffers=1 drop=true \
+             appsrc name=ai_src format=time is-live=true max-buffers=4 leaky-type=downstream ! sel.sink_1 \
+             input-selector name=sel sync-streams=false ! {}",
             source_pipeline, sink_pipeline
         );
 
@@ -83,12 +86,12 @@ impl GStreamerEngine {
             .is_some_and(|scheme| scheme.eq_ignore_ascii_case("srt://"))
         {
             return Ok(format!(
-                "srtsrc uri=\"{uri}\" ! queue ! decodebin3 name=decoder decoder. ! queue ! video/x-raw ! videoconvert"
+                "srtsrc uri=\"{uri}\" ! queue ! decodebin3 name=decoder decoder. ! queue ! video/x-raw ! videoconvert ! videoscale"
             ));
         }
 
         Ok(format!(
-            "uridecodebin3 uri=\"{uri}\" name=decoder decoder. ! queue ! video/x-raw ! videoconvert"
+            "uridecodebin3 uri=\"{uri}\" name=decoder decoder. ! queue ! video/x-raw ! videoconvert ! videoscale"
         ))
     }
 
@@ -160,6 +163,29 @@ impl StreamController for GStreamerEngine {
     }
 
     async fn start(&self) -> Result<(), EngineError> {
+        // Surface asynchronous pipeline failures (e.g. a sink losing its
+        // connection) which are otherwise silently posted on the bus.
+        if let Some(bus) = self.pipeline.bus() {
+            std::thread::spawn(move || {
+                use gstreamer::MessageView;
+                for msg in bus.iter_timed(gstreamer::ClockTime::NONE) {
+                    match msg.view() {
+                        MessageView::Error(err) => error!(
+                            source = ?err.src().map(|s| s.path_string()),
+                            error = %err.error(),
+                            debug = ?err.debug(),
+                            "GStreamer pipeline error"
+                        ),
+                        MessageView::Eos(_) => {
+                            warn!("GStreamer pipeline reached end-of-stream");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+
         self.pipeline
             .set_state(gstreamer::State::Playing)
             .map_err(|e| EngineError::StateChangeFailed(e.to_string()))?;
