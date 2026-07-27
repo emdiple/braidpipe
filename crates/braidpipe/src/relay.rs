@@ -49,18 +49,18 @@ pub fn spawn(
         AppSinkCallbacks::builder()
             .new_sample(move |sink| {
                 let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                if let Some(buffer) = sample.buffer() {
-                    if let Ok(map) = buffer.map_readable() {
-                        // try_send: if the relay is still busy with the
-                        // previous frame, drop this one instead of blocking
-                        // the streaming thread.
-                        let _ = tx.try_send(RawFrame {
-                            data: map.as_slice().to_vec(),
-                            pts: buffer.pts(),
-                            duration: buffer.duration(),
-                            caps: sample.caps().map(|c| c.to_owned()),
-                        });
-                    }
+                if let Some(buffer) = sample.buffer()
+                    && let Ok(map) = buffer.map_readable()
+                {
+                    // try_send: if the relay is still busy with the previous
+                    // frame, drop this one instead of blocking the streaming
+                    // thread.
+                    let _ = tx.try_send(RawFrame {
+                        data: map.as_slice().to_vec(),
+                        pts: buffer.pts(),
+                        duration: buffer.duration(),
+                        caps: sample.caps().map(|c| c.to_owned()),
+                    });
                 }
                 Ok(gst::FlowSuccess::Ok)
             })
@@ -70,7 +70,12 @@ pub fn spawn(
     // Allow 1.5 frame periods for the full SHM + UDS roundtrip
     let deadline = Duration::from_secs_f64(1.5 / f64::from(fps.max(1)));
 
-    info!(width, height, ?deadline, "Frame relay attached to AI branch");
+    info!(
+        width,
+        height,
+        ?deadline,
+        "Frame relay attached to AI branch"
+    );
     tokio::spawn(relay_loop(rx, ai_src, shm, bridge, deadline));
 }
 
@@ -99,11 +104,9 @@ async fn relay_loop(
             }
         }
 
-        if !caps_applied {
-            if let Some(caps) = &frame.caps {
-                ai_src.set_caps(Some(caps));
-                caps_applied = true;
-            }
+        if !caps_applied && let Some(caps) = &frame.caps {
+            ai_src.set_caps(Some(caps));
+            caps_applied = true;
         }
 
         let mut buffer = gst::Buffer::from_mut_slice(data);

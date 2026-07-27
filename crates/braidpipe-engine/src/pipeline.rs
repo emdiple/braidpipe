@@ -113,34 +113,6 @@ impl GStreamerEngine {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::GStreamerEngine;
-
-    #[test]
-    fn creates_a_decodebin3_pipeline_for_srt_uris() {
-        let pipeline = GStreamerEngine::uri_source_pipeline("srt://127.0.0.1:9000")
-            .expect("valid URI should build a source pipeline");
-
-        assert!(pipeline.contains("srtsrc"));
-        assert!(pipeline.contains("decodebin3"));
-        assert!(pipeline.contains("uri=\"srt://127.0.0.1:9000\""));
-    }
-
-    #[test]
-    fn creates_a_uri_decoder_pipeline_for_non_srt_uris() {
-        let pipeline = GStreamerEngine::uri_source_pipeline("ndi://Studio%20Camera")
-            .expect("valid URI should build a source pipeline");
-
-        assert!(pipeline.contains("uridecodebin3"));
-    }
-
-    #[test]
-    fn rejects_uris_without_a_scheme() {
-        assert!(GStreamerEngine::uri_source_pipeline("127.0.0.1:9000").is_err());
-    }
-}
-
 impl StreamController for GStreamerEngine {
     async fn set_active_branch(&self, branch: ActiveBranch) -> Result<(), EngineError> {
         let target_pad = match branch {
@@ -203,5 +175,33 @@ impl StreamController for GStreamerEngine {
         self.is_running.store(false, Ordering::SeqCst);
         info!("GStreamer engine pipeline stopped");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GStreamerEngine;
+
+    #[test]
+    fn creates_a_decodebin3_pipeline_for_srt_uris() {
+        let pipeline = GStreamerEngine::uri_source_pipeline("srt://127.0.0.1:9000")
+            .expect("valid URI should build a source pipeline");
+
+        assert!(pipeline.contains("srtsrc"));
+        assert!(pipeline.contains("decodebin3"));
+        assert!(pipeline.contains("uri=\"srt://127.0.0.1:9000\""));
+    }
+
+    #[test]
+    fn creates_a_uri_decoder_pipeline_for_non_srt_uris() {
+        let pipeline = GStreamerEngine::uri_source_pipeline("ndi://Studio%20Camera")
+            .expect("valid URI should build a source pipeline");
+
+        assert!(pipeline.contains("uridecodebin3"));
+    }
+
+    #[test]
+    fn rejects_uris_without_a_scheme() {
+        assert!(GStreamerEngine::uri_source_pipeline("127.0.0.1:9000").is_err());
     }
 }

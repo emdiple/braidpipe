@@ -13,8 +13,7 @@ use tokio::signal;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_SOURCE: &str =
-    "videotestsrc is-live=true pattern=ball ! video/x-raw,width=1280,height=720,framerate=30/1 ! videoconvert";
+const DEFAULT_SOURCE: &str = "videotestsrc is-live=true pattern=ball ! video/x-raw,width=1280,height=720,framerate=30/1 ! videoconvert";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Zero-downtime AI video middleware daemon", long_about = None)]
