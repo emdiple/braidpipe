@@ -1,10 +1,24 @@
-# Braidpipe
+<h1 align="center">
+  <img src="assets/braidpipe-wordmark.png" alt="braidpipe" width="420">
+</h1>
 
-**Never-dark AI video middleware.** braidpipe ingests a live video stream, hands raw frames to a Python process for AI/CV work over shared memory, re-encodes the result, and streams it out — and if that Python process crashes, stalls, or falls behind, the output stream keeps running on untouched frames instead of going dark.
+<p align="center"><strong>Never-dark AI video middleware.</strong></p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-FF6D0E"></a>
+  <img alt="Rust 1.85+" src="https://img.shields.io/badge/rust-1.85%2B-FF6D0E?logo=rust&logoColor=white">
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-FF6D0E?logo=python&logoColor=white">
+  <img alt="GStreamer 1.20+" src="https://img.shields.io/badge/gstreamer-1.20%2B-FF6D0E">
+  <img alt="Platform: Linux and macOS" src="https://img.shields.io/badge/platform-linux%20%7C%20macOS-FF6D0E">
+</p>
+
+---
+
+braidpipe ingests a live video stream, hands raw frames to a Python process for AI/CV work over shared memory, re-encodes the result, and streams it out — and if that Python process crashes, stalls, or falls behind, the output stream keeps running on untouched frames instead of going dark.
 
 The Rust daemon owns the media path. Python only ever sees pixels in a shared-memory slot and a small JSON message telling it which slot to look at. That separation is the whole point: an exception in a model's inference code must never be able to take the broadcast off air.
 
-```
+```text
                      ┌─────────────────────────────────┐
    SRT / UDP / RTP   │            braidpipe            │
    NDI / file / test │                                 │
@@ -27,23 +41,22 @@ The `input-selector` decides, frame by frame, whether the viewer sees the AI bra
 
 ## Table of contents
 
-- [Braidpipe](#braidpipe)
-  - [Table of contents](#table-of-contents)
-  - [How the failover works](#how-the-failover-works)
-  - [Requirements](#requirements)
-  - [Install](#install)
-  - [Quick start](#quick-start)
-  - [Real-world pipelines](#real-world-pipelines)
-  - [Command-line reference](#command-line-reference)
-  - [Writing a Python worker](#writing-a-python-worker)
-  - [The IPC contract](#the-ipc-contract)
-  - [Testing failover](#testing-failover)
-  - [Troubleshooting](#troubleshooting)
-  - [Project layout](#project-layout)
-  - [Development](#development)
-  - [Known limitations](#known-limitations)
-  - [Contributing](#contributing)
-  - [License](#license)
+- [Table of contents](#table-of-contents)
+- [How the failover works](#how-the-failover-works)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Real-world pipelines](#real-world-pipelines)
+- [Command-line reference](#command-line-reference)
+- [Writing a Python worker](#writing-a-python-worker)
+- [The IPC contract](#the-ipc-contract)
+- [Testing failover](#testing-failover)
+- [Troubleshooting](#troubleshooting)
+- [Project layout](#project-layout)
+- [Development](#development)
+- [Known limitations](#known-limitations)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## How the failover works
 
@@ -57,12 +70,12 @@ Both branch queues are `leaky=downstream`, which matters more than it looks: wit
 
 ## Requirements
 
-| | |
-| --- | --- |
-| Rust | 1.85+ (edition 2024) |
-| Python | 3.10+ (3.13+ recommended, see note) |
-| GStreamer | 1.20+ for `appsrc leaky-type`; developed against 1.28 |
-| OS | Linux or macOS (POSIX shared memory + Unix datagram sockets) |
+| Component | Version | Notes |
+| --- | --- | --- |
+| Rust | 1.85+ | Edition 2024 |
+| Python | 3.10+ | 3.13+ recommended, see note below |
+| GStreamer | 1.20+ | Needed for `appsrc leaky-type`; developed against 1.28 |
+| OS | Linux or macOS | POSIX shared memory + Unix datagram sockets |
 
 GStreamer plugins depend on what you actually stream: `srt` for SRT, `x264`/`libav` for H.264, `rtmp` for RTMP output, and a third-party plugin for NDI.
 
@@ -298,6 +311,7 @@ Ports and adapters, so the availability logic can be tested without GStreamer or
 | [crates/braidpipe/](crates/braidpipe/) | The daemon: CLI, wiring, worker supervision, and [relay.rs](crates/braidpipe/src/relay.rs) — the appsink → shm → Python → appsrc data path. |
 | [python/braidpipe/](python/braidpipe/) | `shm.py` (the Rust layout mirror) and `worker.py` (a working example). |
 | [scripts/](scripts/) | Manual end-to-end checks. |
+| [assets/](assets/) | Logo files: transparent wordmark and icon PNGs, plus a multi-size `.ico`. |
 
 ## Development
 
@@ -327,3 +341,7 @@ Commit messages follow Conventional Commits with a single-line subject, for exam
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+<p align="center">
+  <img src="assets/braidpipe-icon.png" alt="" width="44">
+</p>
