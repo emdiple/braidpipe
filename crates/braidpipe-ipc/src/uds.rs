@@ -1,10 +1,14 @@
 use braidpipe_core::ports::ai::{AiBridge, FrameMetadata, IpcError};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::net::UnixDatagram;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
+
+/// Consecutive frame-roundtrip failures before the worker is declared unhealthy
+const MAX_FAILURE_STREAK: u32 = 30;
 
 /// Control packet sent from Rust -> Python
 #[derive(Debug, Serialize, Deserialize)]
@@ -26,6 +30,7 @@ pub struct FrameProcessedPacket {
 pub struct UdsControlBridge {
     socket: UnixDatagram,
     python_sock_path: PathBuf,
+    failure_streak: AtomicU32,
 }
 
 impl UdsControlBridge {
@@ -50,7 +55,20 @@ impl UdsControlBridge {
         Ok(Self {
             socket,
             python_sock_path: python_path,
+            // Start unhealthy: the AI branch must prove itself with one
+            // successful frame roundtrip before the Watchdog may select it.
+            failure_streak: AtomicU32::new(MAX_FAILURE_STREAK),
         })
+    }
+
+    /// Called by the frame relay after a successful Python roundtrip
+    pub fn record_success(&self) {
+        self.failure_streak.store(0, Ordering::Relaxed);
+    }
+
+    /// Called by the frame relay when Python misses a deadline or errors
+    pub fn record_failure(&self) {
+        self.failure_streak.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -116,7 +134,9 @@ impl AiBridge for UdsControlBridge {
     }
 
     async fn is_healthy(&self) -> bool {
-        // Simple non-blocking socket check to verify Python is listening
+        // The worker must both be listening on its socket AND keeping up with
+        // the frame deadlines (a stale socket file survives a SIGKILL).
         self.python_sock_path.exists()
+            && self.failure_streak.load(Ordering::Relaxed) < MAX_FAILURE_STREAK
     }
 }

@@ -9,23 +9,28 @@ pub const SLOT_FREE: u8 = 0;
 pub const SLOT_READY_FOR_AI: u8 = 1;
 pub const SLOT_PROCESSING: u8 = 2;
 
-/// Memory-mapped header at offset 0 of /dev/shm
+/// Memory-mapped header at offset 0 of /dev/shm.
+/// Layout is fully explicit (no implicit repr(C) padding) so the Python side
+/// can mirror it with struct format "<IIBB2xI16s" (32 bytes total).
 #[repr(C)]
 pub struct ShmHeader {
-    pub width: u32,
-    pub height: u32,
-    pub channels: u8,
-    pub slot_count: u8,
-    pub slot_size: u32,
-    pub _padding: [u8; 18], // Align to 32-byte boundary
+    pub width: u32,          // offset 0
+    pub height: u32,         // offset 4
+    pub channels: u8,        // offset 8
+    pub slot_count: u8,      // offset 9
+    pub _pad: [u8; 2],       // offset 10
+    pub slot_size: u32,      // offset 12
+    pub _reserved: [u8; 16], // offset 16..32
 }
 
-/// Metadata control block preceding each slot's raw pixel buffer
+/// Metadata control block preceding each slot's raw pixel buffer.
+/// Mirrors Python struct format "<B7xQQ" (24 bytes total).
 #[repr(C)]
 pub struct SlotHeader {
-    pub state: AtomicU8,
-    pub frame_id: AtomicU64,
-    pub timestamp_us: AtomicU64,
+    pub state: AtomicU8,         // offset 0
+    pub _pad: [u8; 7],           // offset 1
+    pub frame_id: AtomicU64,     // offset 8
+    pub timestamp_us: AtomicU64, // offset 16
 }
 
 pub struct ShmRingBuffer {
@@ -58,6 +63,10 @@ impl ShmRingBuffer {
             .map_err(|e| IpcError::ShmError(format!("Invalid SHM name: {e}")))?;
 
         unsafe {
+            // Remove any stale segment from a crashed run: on macOS ftruncate
+            // fails with EINVAL when a POSIX SHM object already has a size.
+            libc::shm_unlink(c_name.as_ptr());
+
             // 1. Open POSIX shared memory file descriptor (/dev/shm)
             let fd = libc::shm_open(c_name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o666);
             if fd < 0 {
@@ -96,8 +105,9 @@ impl ShmRingBuffer {
                     height,
                     channels,
                     slot_count,
+                    _pad: [0; 2],
                     slot_size: per_slot_total as u32,
-                    _padding: [0; 18],
+                    _reserved: [0; 16],
                 },
             );
 
@@ -109,6 +119,7 @@ impl ShmRingBuffer {
                     slot_header_ptr,
                     SlotHeader {
                         state: AtomicU8::new(SLOT_FREE),
+                        _pad: [0; 7],
                         frame_id: AtomicU64::new(0),
                         timestamp_us: AtomicU64::new(0),
                     },
@@ -125,6 +136,62 @@ impl ShmRingBuffer {
                 header: &*header_ptr,
             })
         }
+    }
+
+    /// Reclaims a slot whose notification or ack failed, so a worker that
+    /// never learned about the frame cannot leak the slot forever. Only flips
+    /// READY_FOR_AI back to FREE; a slot Python already freed is left alone.
+    pub fn release_slot(&self, slot_index: u8) {
+        if slot_index >= self.header.slot_count {
+            return;
+        }
+
+        let header_size = std::mem::size_of::<ShmHeader>();
+        let slot_offset = header_size + (slot_index as usize * self.header.slot_size as usize);
+
+        unsafe {
+            let slot_header = &*(self.mmap_ptr.add(slot_offset) as *const SlotHeader);
+            let _ = slot_header.state.compare_exchange(
+                SLOT_READY_FOR_AI,
+                SLOT_FREE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+
+    /// Size in bytes of one raw frame payload (width * height * channels)
+    pub fn frame_size(&self) -> usize {
+        self.header.slot_size as usize - std::mem::size_of::<SlotHeader>()
+    }
+
+    /// Copies the pixel payload of a slot back out of shared memory.
+    /// Called after Python acknowledges a processed frame.
+    pub fn read_frame(&self, slot_index: u8, out: &mut [u8]) -> Result<(), IpcError> {
+        if slot_index >= self.header.slot_count {
+            return Err(IpcError::ShmError(format!(
+                "Slot index {slot_index} out of range"
+            )));
+        }
+
+        let payload_size = self.frame_size();
+        if out.len() > payload_size {
+            return Err(IpcError::ShmError(format!(
+                "Read size ({}) exceeds slot payload capacity ({payload_size})",
+                out.len()
+            )));
+        }
+
+        let header_size = std::mem::size_of::<ShmHeader>();
+        let slot_header_size = std::mem::size_of::<SlotHeader>();
+        let slot_offset = header_size + (slot_index as usize * self.header.slot_size as usize);
+
+        unsafe {
+            let pixel_buffer_ptr = self.mmap_ptr.add(slot_offset + slot_header_size);
+            ptr::copy_nonoverlapping(pixel_buffer_ptr, out.as_mut_ptr(), out.len());
+        }
+
+        Ok(())
     }
 }
 
