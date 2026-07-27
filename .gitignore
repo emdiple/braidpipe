@@ -24,3 +24,9 @@ __pycache__/
 # Python virtual environments
 .venv/
 venv/
+
+# macOS finder metadata
+.DS_Store
+
+# local developer's files
+.local/
