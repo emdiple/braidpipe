@@ -28,5 +28,8 @@ venv/
 # macOS finder metadata
 .DS_Store
 
+# Model weights downloaded at runtime by the detection example
+*.pt
+
 # local developer's files
 .local/
