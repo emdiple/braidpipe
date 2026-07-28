@@ -23,11 +23,23 @@ impl GStreamerEngine {
         // q_pass is leaky so that, while the AI branch is selected, buffers
         // piling up on the inactive passthrough pad can never block the tee
         // and stall the whole pipeline.
+        //
+        // Each AI-side link converts for itself. A tee delivers one format to
+        // every branch, so without these the appsink's RGB requirement is
+        // forced all the way back through the source: fine for videotestsrc,
+        // which offers RGB natively, but camera sources negotiate a native
+        // format instead and the branch stalls with no error on the bus.
+        //
+        // max-latency=-1 on the appsrc is what makes live sources work at all.
+        // An appsrc defaults to reporting zero maximum latency, and a live
+        // source reports a minimum of one frame period; the selector then
+        // aggregates min > max, latency configuration fails, and the pipeline
+        // sits in PLAYING forever without ever delivering a buffer.
         let pipe_desc = format!(
             "{} ! tee name=t \
              t. ! queue name=q_pass leaky=downstream max-size-buffers=3 ! sel.sink_0 \
-             t. ! queue name=q_ai leaky=downstream max-size-buffers=3 ! appsink name=ai_sink sync=false max-buffers=1 drop=true \
-             appsrc name=ai_src format=time is-live=true max-buffers=4 leaky-type=downstream ! sel.sink_1 \
+             t. ! queue name=q_ai leaky=downstream max-size-buffers=3 ! videoconvert ! appsink name=ai_sink sync=false max-buffers=1 drop=true \
+             appsrc name=ai_src format=time is-live=true max-buffers=4 leaky-type=downstream min-latency=0 max-latency=-1 ! videoconvert ! sel.sink_1 \
              input-selector name=sel sync-streams=false ! {}",
             source_pipeline, sink_pipeline
         );
