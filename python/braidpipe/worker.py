@@ -116,7 +116,8 @@ def run_worker(rust_sock_path: str, python_sock_path: str):
                 (50, 80), # X, Y coordinates
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1.5, # Font scale
-                (0, 0, 255), # Red color (BGR format)
+                (255, 0, 0), # Red. Frames here are RGB, so this is (R, G, B) --
+                             # the OpenCV habit of (0, 0, 255) renders blue.
                 3, # Line thickness
             )
             
