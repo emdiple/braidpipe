@@ -21,7 +21,7 @@ The Rust daemon owns the media path. Python only ever sees pixels in a shared-me
 ```text
                      ┌─────────────────────────────────┐
    SRT / UDP / RTP   │            braidpipe            │
-   NDI / file / test │                                 │
+ NDI / camera / file │                                 │
         ──────────►  │  decode ──┬── queue ─────────┐  │
                      │           │                  │  │
                      │           │            input-selector ──► encode ──►  RTMP / SRT
@@ -77,7 +77,7 @@ Both branch queues are `leaky=downstream`, which matters more than it looks: wit
 | GStreamer | 1.20+ | Needed for `appsrc leaky-type`; developed against 1.28 |
 | OS | Linux or macOS | POSIX shared memory + Unix datagram sockets |
 
-GStreamer plugins depend on what you actually stream: `srt` for SRT, `x264`/`libav` for H.264, `rtmp` for RTMP output, and a third-party plugin for NDI.
+GStreamer plugins depend on what you actually stream: `srt` for SRT, `x264`/`libav` for H.264, `rtmp` for RTMP output, `avfvideosrc` (macOS, in plugins-bad) or `v4l2src` (Linux, in plugins-good) for cameras, and a third-party plugin for NDI.
 
 On Python 3.13+, `SharedMemory(track=False)` keeps Python's resource tracker from unlinking the Rust-owned segment when the worker exits. On older versions the bundled worker falls back automatically, but you may see a resource-tracker warning at shutdown and should restart the daemon rather than reusing the segment.
 
@@ -153,6 +153,22 @@ cargo run -p braidpipe --release -- \
   --sink 'videoconvert ! autovideosink'
 ```
 
+**A webcam**, on macOS (`avfvideosrc`) or Linux (`v4l2src device=/dev/video0`):
+
+```bash
+cargo run -p braidpipe --release -- \
+  --source 'avfvideosrc device-index=0 ! videoconvert ! videoscale ! video/x-raw,width=1280,height=720,framerate=30/1 ! videoconvert' \
+  --sink 'videoconvert ! autovideosink'
+```
+
+The scaling matters: `--width`/`--height` fix the shared-memory slot geometry, and a camera negotiates whatever resolution it likes unless you tell it otherwise. List your devices with `gst-device-monitor-1.0 Video/Source` — the index is not always the one you expect, and on macOS index 0 is often an iPhone offering itself as a Continuity Camera. A camera that is present but not actually streaming sits in PLAYING and delivers nothing, which looks exactly like a braidpipe stall; check it in isolation first:
+
+```bash
+gst-launch-1.0 avfvideosrc device-index=0 num-buffers=10 ! fakesink
+```
+
+That should reach end-of-stream in a couple of seconds. If it hangs, the problem is the camera, not this project.
+
 **1080p60:**
 
 ```bash
@@ -224,6 +240,43 @@ Four rules keep the stream healthy:
 
 Point `--python-script` at your own file. Because Python puts the script's own directory on `sys.path`, a worker living beside `shm.py` can `from shm import SharedMemoryManager` directly; from elsewhere, add `python/braidpipe` to `sys.path` or install it as a package.
 
+### Bundled examples
+
+Three workers ship with the project, each self-contained and runnable as-is:
+
+| Worker | Needs | Shows |
+| --- | --- | --- |
+| [worker.py](python/braidpipe/worker.py) | opencv | The minimum contract: a text overlay and a frame counter |
+| [worker_edges.py](python/braidpipe/worker_edges.py) | opencv | A whole-frame pixel transform, and reporting `success: false` instead of dying |
+| [worker_detect.py](python/braidpipe/worker_detect.py) | ultralytics, torch | A model too slow to run inline, moved to a thread with cached results |
+
+```bash
+cargo run -p braidpipe --release -- --python-script python/braidpipe/worker_edges.py
+cargo run -p braidpipe --release -- --python-script python/braidpipe/worker_detect.py
+```
+
+`worker_edges.py` is the one to reach for when testing the plumbing: no model, no network, and it rewrites only the left half of the frame so the boundary between processed and untouched pixels is visible on screen.
+
+`worker_detect.py` runs YOLO and is the more instructive one. A CPU inference pass does not fit in 50 ms, so the socket loop never waits for it — a detector thread takes a copy of every third frame, and every frame is annotated with the most recent boxes available. Boxes lag the picture slightly; no frame misses its deadline. It also caps `torch.set_num_threads` and the inference resolution, because torch left unbounded takes every core and starves the loop that only needs a millisecond of it. Without those caps the worker flaps between branches every few seconds; with them the AI branch stays selected. The first run downloads weights (~6 MB) into the working directory.
+
+### Writing a worker in another language
+
+Nothing in the contract is Python-specific. [crates/braidpipe-ipc/examples/worker.rs](crates/braidpipe-ipc/examples/worker.rs) is a complete worker in Rust — it attaches to the segment, reuses the daemon's own `ShmHeader`/`SlotHeader`/packet types so it cannot drift out of sync with them, transforms pixels, frees the slot, and acks.
+
+A worker only ever *attaches* to shared memory. Never call `ShmRingBuffer::create` from one: it unlinks and reinitialises the segment out from under the running daemon.
+
+The daemon always spawns its `--python-script`, so point that at a no-op and run your own worker alongside it:
+
+```bash
+# terminal 1 — creates the shared memory segment and streams
+cargo run -p braidpipe --release -- --python-script /dev/null
+
+# terminal 2 — the AI branch is selected on this worker's first good frame
+cargo run -p braidpipe-ipc --release --example worker
+```
+
+Any language with POSIX shared memory, Unix datagram sockets, and a JSON parser can do the same. What it must implement is the [IPC contract](#the-ipc-contract) below, in full — the four rules above apply regardless of language.
+
 ## The IPC contract
 
 **Shared memory** — one POSIX object holding a 32-byte header followed by `slot_count` slots. Each slot is a 24-byte header plus `width × height × channels` bytes of pixels. All layouts are explicitly padded on the Rust side and mirrored by `struct` format strings in [python/braidpipe/shm.py](python/braidpipe/shm.py), which assert their own sizes at import — a mismatch fails loudly instead of silently reading garbage.
@@ -257,20 +310,28 @@ The interesting property is what happens when Python dies mid-stream. Start the 
 kill -9 <worker-pid>
 ```
 
-Within about a second you should see `Successfully switched video stream branch branch=Passthrough`, the overlay disappear, and the stream continue without a stall, a black frame, or a dropped publisher connection.
+Within about a second you should see `Successfully switched video stream branch branch=Passthrough`, the overlay disappear, and the stream continue without a stall, a black frame, or a dropped publisher connection. Measured on a 30 fps test pattern: the switch lands 1.0 s after the kill, and output frames keep arriving at exactly 30 fps across it.
 
-Avoid `pkill -f 'worker.py'`. `pkill -f` matches the *whole* command line, and the daemon's own command line contains `--python-script python/braidpipe/worker.py` — so that pattern kills the daemon along with the worker and proves nothing. If you want a pattern, anchor it to the interpreter:
+**Killing the worker by pattern is harder than it looks, and most obvious attempts are wrong.**
 
-```bash
-pgrep -fl '[p]ython3 python/braidpipe/worker.py'    # check first
-pkill -9 -f '[p]ython3 python/braidpipe/worker.py'
-```
+`pkill -f 'worker.py'` matches the *whole* command line, and the daemon's own command line contains `--python-script python/braidpipe/worker.py` — so it kills the daemon too and proves nothing. Anchoring to the interpreter does not help either: `.venv/bin/python3` is a symlink chain, so the running process reports its resolved interpreter path (`…/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python` on Homebrew macOS), and a pattern containing `python3` never matches at all. It fails silently, which is worse than failing loudly.
 
-Nothing respawns the worker (see [Known limitations](#known-limitations)), but you can start one by hand and the daemon will pick it up on its next successful frame:
+Target the worker by parentage instead — it is the daemon's only child, on any platform:
 
 ```bash
-.venv/bin/python3 python/braidpipe/worker.py
+pgrep -P "$(pgrep -x braidpipe)" -l     # check first: one PID, the worker
+pkill -9 -P "$(pgrep -x braidpipe)"
 ```
+
+Or just use the PID the daemon already printed, which is the same number.
+
+Nothing respawns the worker (see [Known limitations](#known-limitations)), but you can start one by hand and the daemon picks it up on its next successful frame — verified: `branch=AiProcess` returns within a couple of seconds:
+
+```bash
+.venv/bin/python3 python/braidpipe/worker_edges.py
+```
+
+Run it from the repository root, and note that a hand-started worker is no longer a child of the daemon, so the `pgrep -P` trick above will not find it a second time.
 
 There's also a manual SRT check that exercises URI ingestion end to end with a graphical sink:
 
@@ -288,6 +349,14 @@ pkill -9 -f 'target/release/braidpipe'
 ```
 
 Symptoms of cross-talk include `Discarded stale Python ack` with wildly out-of-range frame IDs, and RTMP sinks failing to connect because another publisher holds the URL.
+
+**The pipeline reaches PLAYING and then nothing happens** — no frames, no branch switch, near-zero CPU, no error on the bus. With a live source this is almost always a latency negotiation failure inside the pipeline. The appsrc declares `max-latency=-1` to prevent it: an appsrc otherwise reports zero maximum latency while a live source reports a minimum of one frame period, the selector aggregates min > max, and the pipeline stalls silently. The two AI-side links (`tee` → appsink, and appsrc → selector) also carry their own `videoconvert` so the appsink's RGB requirement is never forced back through the source. If you see it again, the signature is in the GStreamer logs:
+
+```
+input-selector <sel:src>: minimum latency bigger than maximum latency
+```
+
+Raising `GST_DEBUG` to find it is reasonable, but redirect to a file you are willing to lose — that one error repeats per latency query and can produce gigabytes per minute.
 
 **Output goes dark when the AI branch is selected.** Check the log for pipeline errors — the bus watcher surfaces asynchronous failures that would otherwise be silent. Then confirm your sink can accept the AI branch's caps, which are `video/x-raw,format=RGB` at the configured resolution.
 
@@ -307,9 +376,9 @@ Ports and adapters, so the availability logic can be tested without GStreamer or
 | --- | --- |
 | [crates/braidpipe-core/](crates/braidpipe-core/) | The watchdog FSM and the `StreamController` / `ShmWriter` / `AiBridge` port traits. No GStreamer, no sockets. |
 | [crates/braidpipe-engine/](crates/braidpipe-engine/) | GStreamer adapter: pipeline construction, branch switching, bus error reporting, and the macOS run-loop wrapper. |
-| [crates/braidpipe-ipc/](crates/braidpipe-ipc/) | The shared-memory ring buffer and the Unix-datagram control bridge with its health tracking. |
+| [crates/braidpipe-ipc/](crates/braidpipe-ipc/) | The shared-memory ring buffer and the Unix-datagram control bridge with its health tracking, plus [examples/worker.rs](crates/braidpipe-ipc/examples/worker.rs) — a worker written in Rust. |
 | [crates/braidpipe/](crates/braidpipe/) | The daemon: CLI, wiring, worker supervision, and [relay.rs](crates/braidpipe/src/relay.rs) — the appsink → shm → Python → appsrc data path. |
-| [python/braidpipe/](python/braidpipe/) | `shm.py` (the Rust layout mirror) and `worker.py` (a working example). |
+| [python/braidpipe/](python/braidpipe/) | `shm.py` (the Rust layout mirror) and three example workers: text overlay, edge transform, and YOLO detection. |
 | [scripts/](scripts/) | Manual end-to-end checks. |
 | [assets/](assets/) | Logo files: transparent wordmark and icon PNGs, plus a multi-size `.ico`. |
 
@@ -331,6 +400,7 @@ cargo fmt --all
 - **Frames are copied, not zero-copy, on the Rust side.** Each frame is copied out of the GStreamer buffer into shared memory and back. Python's view is genuinely zero-copy; Rust's is not.
 - **No hardware-accelerated decode by default.** `decodebin3` picks whatever is available; wire an explicit hardware decoder through `--source` if you need one.
 - **Video only.** Audio is not carried through the pipeline.
+- **No Python SDK.** `shm.py` mirrors the shared-memory layout and nothing more: it is not packaged, not on PyPI, and has no importable name. Every worker re-implements the same socket loop, slot release, and ack handling by copying an example. A thin `braidpipe` package wrapping that loop would remove the copy-paste, and is the obvious next piece of work.
 
 ## Contributing
 
