@@ -59,6 +59,16 @@ class SharedMemoryManager:
             offset=payload_offset,
         )
 
+    def read_slot_header(self, slot_idx: int) -> tuple[int, int, int]:
+        """Returns (state, frame_id, timestamp_us) for a slot.
+
+        `timestamp_us` is the wall clock the daemon recorded as it wrote the
+        frame, so subtracting `time.time()` here gives the one-way IPC delay.
+        """
+        slot_offset = HEADER_SIZE + (slot_idx * self.slot_size)
+        raw = bytes(self.shm[slot_offset : slot_offset + SLOT_HEADER_SIZE])
+        return struct.unpack(SLOT_HEADER_FMT, raw)
+
     def mark_slot_free(self, slot_idx: int):
         """Resets the slot state back to FREE so Rust can write the next frame."""
         slot_offset = HEADER_SIZE + (slot_idx * self.slot_size)
