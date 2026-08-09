@@ -47,10 +47,13 @@ The `input-selector` decides, frame by frame, whether the viewer sees the AI bra
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Real-world pipelines](#real-world-pipelines)
+- [Output presets](#output-presets)
+- [Audio passthrough](#audio-passthrough)
 - [Command-line reference](#command-line-reference)
 - [Writing a Python worker](#writing-a-python-worker)
 - [The IPC contract](#the-ipc-contract)
 - [Testing failover](#testing-failover)
+- [Measuring latency](#measuring-latency)
 - [Troubleshooting](#troubleshooting)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -133,10 +136,13 @@ cargo run -p braidpipe --release -- --passthrough-only
 ```bash
 cargo run -p braidpipe --release -- \
   --uri 'srt://0.0.0.0:9000?mode=listener' \
-  --sink 'videoconvert ! x264enc tune=zerolatency bitrate=4000 speed-preset=veryfast key-int-max=60 \
+  --sink 'videoconvert ! video/x-raw,format=I420 \
+          ! x264enc tune=zerolatency bitrate=4000 speed-preset=veryfast key-int-max=60 \
           ! h264parse config-interval=-1 ! flvmux streamable=true \
-          ! rtmpsink location="rtmp://localhost/live/stream live=1"'
+          ! rtmp2sink sync=false location=rtmp://localhost/live/stream'
 ```
+
+`sync=false` is not incidental — it is worth about 48 ms, for the reasons in [Measuring latency](#measuring-latency).
 
 **NDI in**, with a plugin that registers the `ndi://` scheme:
 
@@ -179,6 +185,92 @@ cargo run -p braidpipe --release -- --width 1920 --height 1080 --fps 60 \
 
 `--uri` and `--source` are mutually exclusive. Use `--uri` when GStreamer can figure out the source on its own (it picks `srtsrc ! decodebin3` for `srt://` and `uridecodebin3` for everything else); use `--source` when you need to spell out elements yourself.
 
+## Output presets
+
+Writing the sink by hand, as above, gives full control — but most deployments want one of a few well-understood points on the latency/bandwidth curve. `--output` plus `--preset` builds the whole encoder + mux + sink chain for you, the way ffmpeg's `-preset` expands into a bag of x264 options:
+
+```bash
+cargo run -p braidpipe --release -- \
+  --uri 'srt://0.0.0.0:9000?mode=listener' \
+  --preset lowlatency --output rtmp://localhost/live/stream
+```
+
+`--output` understands `rtmp://`, `srt://` and `udp://host:port`, and picks the right mux for each (FLV for RTMP, MPEG-TS for SRT/UDP). The daemon logs the sink it built at startup, so you can copy it out and use it as a `--sink` starting point.
+
+| Preset | Encoder settings | GOP | VBV | Sink sync | SRT latency | Intent |
+| --- | --- | --- | --- | --- | --- | --- |
+| `zerolatency` | ultrafast + zerolatency, 6000 kbps | 1 s | 100 ms | `false` | 50 ms | Every latency lever pulled; bandwidth pays for it |
+| `lowlatency` (default) | veryfast + zerolatency, 4500 kbps | 2 s | 200 ms | `false` | 125 ms | The measured sweet spot — same ~40 ms p50 as the tuned harness sink |
+| `balanced` | medium + zerolatency, 3000 kbps | 2 s | 500 ms | `false` | 250 ms | Better compression, still no B-frame delay |
+| `bandwidth` | slow, B-frames + lookahead, 1800 kbps | 4 s | 1000 ms | `true` | 500 ms | Minimum bits for the quality; adds several frames of encoder delay by design |
+
+The VBV column is what makes the bitrate column mean something on the wire: it bounds how far above the target the encoder may burst, and how much encoded data a receiver has to be ready to buffer — so it is simultaneously a bandwidth cap and hidden latency. x264's own default (600 ms) would allow bursts more than half a second long.
+
+Bitrates assume 720p30 — scale them for other formats. A preset only decides defaults; every parameter yields to an environment variable, so you can start from a profile and turn one knob:
+
+| Variable | Overrides | Values |
+| --- | --- | --- |
+| `BRAIDPIPE_ENCODER` | encoder | `x264` (default) or `vtenc` (macOS VideoToolbox) |
+| `BRAIDPIPE_BITRATE_KBPS` | target bitrate | kbps |
+| `BRAIDPIPE_SPEED_PRESET` | x264 speed preset | `ultrafast` … `placebo` |
+| `BRAIDPIPE_ZEROLATENCY` | zero-latency tuning | `1`/`0` — x264 `tune=zerolatency`, vtenc `realtime` |
+| `BRAIDPIPE_GOP_SECONDS` | keyframe interval | seconds |
+| `BRAIDPIPE_VBV_BUF_MS` | x264 VBV buffer (burst bound) | milliseconds |
+| `BRAIDPIPE_SINK_SYNC` | sink clock sync | `1`/`0` — see [Measuring latency](#measuring-latency) for why `0` is worth ~48 ms |
+| `BRAIDPIPE_SRT_LATENCY_MS` | `srtsink` latency budget | milliseconds |
+
+```bash
+# lowlatency profile, but cap the bandwidth
+BRAIDPIPE_BITRATE_KBPS=2500 cargo run -p braidpipe --release -- \
+  --preset lowlatency --output srt://127.0.0.1:8888
+```
+
+Verified end-to-end with the [latency harness](#measuring-latency): `--preset lowlatency --output rtmp://…` measured 39.8 ms p50 / 45.6 ms p99 worker→receiver at 720p30, identical to the hand-tuned sink.
+
+### Measured bandwidth
+
+Bitrate targets are promises until you look at the wire, so `scripts/preset-bandwidth.sh` runs each preset through the full daemon + worker path, captures the RTMP output, and reports what actually left the encoder. Content is a moving scene blended with 30% white noise — a stand-in for camera footage, hard enough to push rate control against its cap. 20-second runs at 720p30, startup excluded:
+
+| Preset | Target | Mean on wire | Worst 1 s | Worst 250 ms burst | Output fps |
+| --- | --- | --- | --- | --- | --- |
+| `zerolatency` | 6000 kbps | 5123 | 5332 | 6481 | 30.0 |
+| `lowlatency` | 4500 kbps | 4501 | 4525 | 4941 | 30.0 |
+| `balanced` | 3000 kbps | 3000 | 3033 | 3291 | 30.0 |
+| `bandwidth` | 1800 kbps | 64 | 142 | 439 | 30.0 |
+
+Three things worth reading out of that table:
+
+- **`lowlatency` and `balanced` hold their targets to within 1%,** and no preset's worst 250 ms burst exceeds its target by more than 10% — that is the VBV bound doing its job. Provision the link for the target plus ~10% and it will not be surprised.
+- **`zerolatency` runs ~15% under target on hard content.** The 100 ms VBV is tight enough to constrain ABR itself, trading a little quality for the strictest burst bound. That is the correct trade for its use case.
+- **`bandwidth` spends almost nothing on this content, and that is by design, not a bug.** Without `tune=zerolatency`, x264's mbtree lookahead rates every block by how much future frames can predict from it — and noise predicts nothing, so mbtree declines to encode it. The synthetic content is 30% noise; real footage has structure everywhere and will sit far closer to target. Either way the target is a hard ceiling, never a floor: this preset buys quality-per-bit, not constant bandwidth. (On pure noise — `BRAIDPIPE_BW_PATTERN=snow` — the effect is even starker, while the three zerolatency presets still hold their caps, since zerolatency disables mbtree.)
+
+## Audio passthrough
+
+Real sources carry audio, and the output should too. `--audio` routes the source's audio around the AI branch — decoded, re-encoded to AAC, and joined back at the output muxer:
+
+```bash
+cargo run -p braidpipe --release -- \
+  --uri 'srt://0.0.0.0:9000?mode=listener' \
+  --audio --preset lowlatency --output rtmp://localhost/live/stream
+```
+
+**How sync works.** There is no dedicated sync machinery, because none is needed: the relay pushes every video frame back into the pipeline with its **original PTS** — whether the worker processed it or the deadline passed and it went through unchanged — and audio keeps the PTS the source gave it. The muxer pairs the two streams by timestamp, exactly as it would in a plain GStreamer pipeline. That also means failover cannot desynchronize anything: the input-selector switches video branches while audio never stops flowing.
+
+Measured on a live SRT source (video + audio) relayed to RTMP at 720p30: steady-state packet cadence was exactly 33.33 ms for video and 21.33 ms for audio (1024 samples at 48 kHz), with under one video frame of relative drift over a 19 s run — both with the worker healthy and with a worker that missed every deadline.
+
+`--audio` needs to know where audio comes from and where it goes:
+
+- **Source** — with `--uri` this is automatic. With a custom `--source`, name your demuxer or decodebin `decoder` so the audio branch can tap it.
+- **Sink** — with `--output` this is automatic (preset muxers are named). With a custom `--sink`, name your muxer `mux`.
+
+| Variable | Overrides | Default |
+| --- | --- | --- |
+| `BRAIDPIPE_AUDIO_ENCODER` | AAC encoder element | `avenc_aac` (in gst-libav; `fdkaacenc`, `faac` also work) |
+| `BRAIDPIPE_AUDIO_BITRATE_KBPS` | audio bitrate | `128` |
+| `BRAIDPIPE_AUDIO_BRANCH` | the entire generated branch, verbatim | `decoder. ! queue ! audio/x-raw ! audioconvert ! audioresample ! avenc_aac bitrate=128000 ! aacparse ! queue ! mux.` |
+
+If the source has no audio stream, don't pass `--audio` — the audio branch would wait forever for a pad that never appears and GStreamer fails the pipeline with a delayed-linking error.
+
 ## Command-line reference
 
 | Flag | Default | Purpose |
@@ -186,6 +278,9 @@ cargo run -p braidpipe --release -- --width 1920 --height 1080 --fps 60 \
 | `-i, --source <PIPELINE>` | test pattern | Explicit GStreamer source fragment |
 | `--uri <URI>` | — | Input URI decoded by GStreamer (`srt://`, `udp://`, `rtp://`, `ndi://`, `file://`) |
 | `-o, --sink <PIPELINE>` | `videoconvert ! autovideosink` | Output fragment appended after the selector |
+| `--output <URL>` | — | Publish target (`rtmp://`, `srt://`, `udp://host:port`); builds the sink from `--preset` |
+| `--preset <NAME>` | `lowlatency` | Latency/bandwidth profile for `--output`, see [Output presets](#output-presets) |
+| `--audio` | off | Carry source audio to the output muxer, see [Audio passthrough](#audio-passthrough) |
 | `-p, --python-script <PATH>` | `python/braidpipe/worker.py` | Worker to launch |
 | `-f, --fps <N>` | `30` | Frame rate; sets the relay deadline and watchdog tick |
 | `--width <N>` / `--height <N>` | `1280` / `720` | Shared-memory slot geometry |
@@ -242,13 +337,14 @@ Point `--python-script` at your own file. Because Python puts the script's own d
 
 ### Bundled examples
 
-Three workers ship with the project, each self-contained and runnable as-is:
+Four workers ship with the project, each self-contained and runnable as-is:
 
 | Worker | Needs | Shows |
 | --- | --- | --- |
 | [worker.py](python/braidpipe/worker.py) | opencv | The minimum contract: a text overlay and a frame counter |
 | [worker_edges.py](python/braidpipe/worker_edges.py) | opencv | A whole-frame pixel transform, and reporting `success: false` instead of dying |
 | [worker_detect.py](python/braidpipe/worker_detect.py) | ultralytics, torch | A model too slow to run inline, moved to a thread with cached results |
+| [worker_stamp.py](python/braidpipe/worker_stamp.py) | numpy | Instrumentation rather than transform — see [Measuring latency](#measuring-latency) |
 
 ```bash
 cargo run -p braidpipe --release -- --python-script python/braidpipe/worker_edges.py
@@ -339,6 +435,65 @@ There's also a manual SRT check that exercises URI ingestion end to end with a g
 bash scripts/e2e-srt-autovideosink.sh
 ```
 
+## Measuring latency
+
+```bash
+bash scripts/rtmp-latency.sh
+```
+
+This publishes a test pattern over RTMP and reports how late every frame was when a receiver got it. It needs nothing installed beyond ffmpeg: `-listen 1` makes ffmpeg the RTMP server braidpipe publishes to *and* the decoder, so no media server sits in the middle inflating the number.
+
+There is no OCR and no guessing. [worker_stamp.py](python/braidpipe/worker_stamp.py) writes the wall clock into every frame as a row of large black-and-white cells, and [rtmp_latency_probe.py](scripts/rtmp_latency_probe.py) reads it back out of the decoded pixels and subtracts. Both processes are on one machine reading one clock, so this is a true one-way measurement rather than a halved round trip. Big cells are the point: H.264 will smear a thin line, but block-coded black and white survive any bitrate worth streaming — the runs below decoded 100% of frames.
+
+Measured on an M-series Mac, 1280x720 @ 30 fps, `x264enc tune=zerolatency speed-preset=ultrafast`, medians over ~700 frames:
+
+| Leg | p50 | What it covers |
+| --- | --- | --- |
+| daemon → worker | **0.17 ms** | SHM write, UDS datagram, worker wake-up |
+| worker → pipeline output | **6.1 ms** | SHM read-back, appsrc, videoconvert, sink |
+| worker → RTMP receiver | **39.5 ms** | the above plus encode, flvmux, RTMP, demux, decode |
+
+So braidpipe's own contribution is about **6 ms**, and everything else is the encoder and the transport. The IPC is not what costs you.
+
+**The single biggest knob is `sync=false` on the sink**, worth 48 ms on its own:
+
+| Sink | p50 |
+| --- | --- |
+| `rtmp2sink` (defaults) | 89.0 ms |
+| `rtmp2sink sync=false` | 41.1 ms |
+
+A syncing sink holds each buffer until its running time plus the pipeline's configured latency, and `processing-deadline` alone contributes 20 ms of that by default. A live source already paces the pipeline, so the clock has nothing left to contribute — it only delays. Pinning `video/x-raw,format=I420` before the encoder is worth another millisecond or so at the median, and stops the encoder inheriting 4:4:4 from the RGB the AI branch works in.
+
+Hardware encoding is *not* automatically the low-latency choice here — VideoToolbox measured slower than x264 at ultrafast:
+
+| Encoder | p50 |
+| --- | --- |
+| `x264enc tune=zerolatency speed-preset=ultrafast` | 40.5 ms |
+| `vtenc_h264 realtime=true` | 46.5 ms |
+
+Useful knobs, all environment variables:
+
+| Variable | Default | |
+| --- | --- | --- |
+| `BRAIDPIPE_RTMP_DURATION` | `30` | seconds to measure |
+| `BRAIDPIPE_RTMP_ENCODER` | `x264` | or `vtenc` |
+| `BRAIDPIPE_RTMP_TUNED` | `1` | set `0` to reproduce the defaults row above |
+| `BRAIDPIPE_RTMP_SINK` | | replace the sink string outright |
+| `BRAIDPIPE_STAMP_BUSY_MS` | `0` | give the worker a fake per-frame cost |
+
+That last one doubles as a failover test with numbers attached. A worker held 60 ms per frame is well past the 50 ms budget, and the run shows exactly what the design promises:
+
+```
+frames received : 402
+  with barcode  : 0
+  unreadable    : 402  (pre-keyframe, or passthrough frames)
+
+worker->received: no samples
+arrival interval  min= 16.30  p50= 33.33  p90= 35.49  p99= 37.87  max= 38.18  (ms, n=401)
+```
+
+Every stamped frame is gone — the AI branch never made its deadline once — and the output still arrives at a 33.33 ms median, which is 30 fps exactly. Nothing downstream could tell the worker had failed.
+
 ## Troubleshooting
 
 **No output at all, or garbled/duplicated frames.** Look for leftover daemons first — this is by far the most common cause. Old instances share the same socket paths, shared-memory name, and output URL, and they will happily fight over all three:
@@ -377,9 +532,9 @@ Ports and adapters, so the availability logic can be tested without GStreamer or
 | [crates/braidpipe-core/](crates/braidpipe-core/) | The watchdog FSM and the `StreamController` / `ShmWriter` / `AiBridge` port traits. No GStreamer, no sockets. |
 | [crates/braidpipe-engine/](crates/braidpipe-engine/) | GStreamer adapter: pipeline construction, branch switching, bus error reporting, and the macOS run-loop wrapper. |
 | [crates/braidpipe-ipc/](crates/braidpipe-ipc/) | The shared-memory ring buffer and the Unix-datagram control bridge with its health tracking, plus [examples/worker.rs](crates/braidpipe-ipc/examples/worker.rs) — a worker written in Rust. |
-| [crates/braidpipe/](crates/braidpipe/) | The daemon: CLI, wiring, worker supervision, and [relay.rs](crates/braidpipe/src/relay.rs) — the appsink → shm → Python → appsrc data path. |
-| [python/braidpipe/](python/braidpipe/) | `shm.py` (the Rust layout mirror) and three example workers: text overlay, edge transform, and YOLO detection. |
-| [scripts/](scripts/) | Manual end-to-end checks. |
+| [crates/braidpipe/](crates/braidpipe/) | The daemon: CLI, wiring, worker supervision, [preset.rs](crates/braidpipe/src/preset.rs) — the latency/bandwidth profiles — and [relay.rs](crates/braidpipe/src/relay.rs) — the appsink → shm → Python → appsrc data path. |
+| [python/braidpipe/](python/braidpipe/) | `shm.py` (the Rust layout mirror), `stamp.py` (the latency barcode), and four example workers: text overlay, edge transform, YOLO detection, and clock stamping. |
+| [scripts/](scripts/) | Manual end-to-end checks, the latency harness, and the per-preset bandwidth measurement. |
 | [assets/](assets/) | Logo files: transparent wordmark and icon PNGs, plus a multi-size `.ico`. |
 
 ## Development
