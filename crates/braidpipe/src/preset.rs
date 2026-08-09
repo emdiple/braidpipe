@@ -13,6 +13,9 @@
 //!   BRAIDPIPE_VBV_BUF_MS    x264 VBV buffer, bounds bitrate bursts
 //!   BRAIDPIPE_SINK_SYNC     1/0, clock-sync the network sink
 //!   BRAIDPIPE_SRT_LATENCY_MS  srtsink receive-side latency budget
+//!   BRAIDPIPE_AUDIO_ENCODER      AAC encoder element (default avenc_aac)
+//!   BRAIDPIPE_AUDIO_BITRATE_KBPS audio target bitrate (default 128)
+//!   BRAIDPIPE_AUDIO_BRANCH       replace the generated audio branch outright
 //!
 //! `--sink` still accepts a raw pipeline string and bypasses all of this.
 
@@ -216,6 +219,39 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
     ))
 }
 
+/// The audio path from the source's decoder to the output muxer.
+///
+/// Audio never enters the AI branch: it flows straight from `decoder.` (the
+/// named decodebin of a `--uri` source) to `mux.` (the named muxer of a preset
+/// sink). Synchronization comes from timestamps, not from this code -- the
+/// relay pushes every video frame back with its original PTS, audio keeps the
+/// PTS the source gave it, and the muxer pairs the two streams by clock. The
+/// plain queues here just have to be deep enough to hold audio while the video
+/// leg spends its AI budget and encoder delay, and the defaults (1 s) dwarf
+/// both.
+pub fn audio_branch() -> Result<String, String> {
+    build_audio_branch(|key| std::env::var(key).ok())
+}
+
+fn build_audio_branch(env: impl Fn(&str) -> Option<String>) -> Result<String, String> {
+    if let Some(branch) = env("BRAIDPIPE_AUDIO_BRANCH") {
+        return Ok(branch);
+    }
+
+    let encoder = env("BRAIDPIPE_AUDIO_ENCODER").unwrap_or_else(|| "avenc_aac".into());
+    let bitrate_kbps: u32 = match env("BRAIDPIPE_AUDIO_BITRATE_KBPS") {
+        Some(v) => parse_num("BRAIDPIPE_AUDIO_BITRATE_KBPS", &v)?,
+        None => 128,
+    };
+
+    // The common AAC encoders (avenc_aac, fdkaacenc, faac) all take bps.
+    Ok(format!(
+        "decoder. ! queue ! audio/x-raw ! audioconvert ! audioresample ! \
+         {encoder} bitrate={} ! aacparse ! queue ! mux.",
+        bitrate_kbps * 1000
+    ))
+}
+
 fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
     match value {
         "1" | "true" | "yes" => Ok(true),
@@ -295,6 +331,31 @@ mod tests {
         let sink = render(&p, "udp://239.0.0.1:5000", 30).unwrap();
         assert!(sink.contains("udpsink sync=false host=239.0.0.1 port=5000"));
         assert!(render(&p, "udp://nohost", 30).is_err());
+    }
+
+    #[test]
+    fn audio_branch_links_decoder_to_mux() {
+        let branch = build_audio_branch(no_env).unwrap();
+        assert!(branch.starts_with("decoder. ! "));
+        assert!(branch.ends_with(" ! mux."));
+        assert!(branch.contains("avenc_aac bitrate=128000"));
+    }
+
+    #[test]
+    fn audio_branch_env_overrides() {
+        let branch = build_audio_branch(|key| match key {
+            "BRAIDPIPE_AUDIO_ENCODER" => Some("fdkaacenc".into()),
+            "BRAIDPIPE_AUDIO_BITRATE_KBPS" => Some("96".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert!(branch.contains("fdkaacenc bitrate=96000"));
+
+        let replaced = build_audio_branch(|key| {
+            (key == "BRAIDPIPE_AUDIO_BRANCH").then(|| "decoder. ! fakesink".to_string())
+        })
+        .unwrap();
+        assert_eq!(replaced, "decoder. ! fakesink");
     }
 
     #[test]

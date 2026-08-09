@@ -17,6 +17,22 @@ pub struct GStreamerEngine {
 impl GStreamerEngine {
     /// Builds the GStreamer pipeline string dynamically based on source/sink specs
     pub fn new(source_pipeline: &str, sink_pipeline: &str) -> Result<Self, EngineError> {
+        Self::new_with_branch(source_pipeline, sink_pipeline, None)
+    }
+
+    /// As [`new`], with an extra top-level branch appended to the description.
+    ///
+    /// This is how audio flows: the branch links elements that the source and
+    /// sink fragments defined by name (typically `decoder.` to `mux.`),
+    /// bypassing the video-only tee/selector graph entirely. Failover never
+    /// touches it -- the input-selector switches video branches while audio
+    /// keeps flowing, and the muxer keeps the two aligned by timestamp because
+    /// the relay preserves PTS across the AI roundtrip.
+    pub fn new_with_branch(
+        source_pipeline: &str,
+        sink_pipeline: &str,
+        extra_branch: Option<&str>,
+    ) -> Result<Self, EngineError> {
         gstreamer::init().map_err(|e| EngineError::BuildFailed(e.to_string()))?;
 
         // Pipeline description string using GStreamer launch syntax.
@@ -40,8 +56,10 @@ impl GStreamerEngine {
              t. ! queue name=q_pass leaky=downstream max-size-buffers=3 ! sel.sink_0 \
              t. ! queue name=q_ai leaky=downstream max-size-buffers=3 ! videoconvert ! appsink name=ai_sink sync=false max-buffers=1 drop=true \
              appsrc name=ai_src format=time is-live=true max-buffers=4 leaky-type=downstream min-latency=0 max-latency=-1 ! videoconvert ! sel.sink_1 \
-             input-selector name=sel sync-streams=false ! {}",
-            source_pipeline, sink_pipeline
+             input-selector name=sel sync-streams=false ! {} {}",
+            source_pipeline,
+            sink_pipeline,
+            extra_branch.unwrap_or("")
         );
 
         let element = gstreamer::parse::launch(&pipe_desc)
@@ -75,9 +93,13 @@ impl GStreamerEngine {
     }
 
     /// Builds a video source from a URI using GStreamer's URI source selection and decodebin3.
-    pub fn new_from_uri(uri: &str, sink_pipeline: &str) -> Result<Self, EngineError> {
+    pub fn new_from_uri(
+        uri: &str,
+        sink_pipeline: &str,
+        extra_branch: Option<&str>,
+    ) -> Result<Self, EngineError> {
         let source_pipeline = Self::uri_source_pipeline(uri)?;
-        Self::new(&source_pipeline, sink_pipeline)
+        Self::new_with_branch(&source_pipeline, sink_pipeline, extra_branch)
     }
 
     fn uri_source_pipeline(uri: &str) -> Result<String, EngineError> {

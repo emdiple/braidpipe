@@ -41,6 +41,11 @@ struct Args {
     #[arg(long, default_value = "lowlatency", requires = "output")]
     preset: String,
 
+    /// Carry the source's audio through to the output. Audio bypasses the AI
+    /// branch and is re-joined at the muxer; sync is preserved by timestamps
+    #[arg(long)]
+    audio: bool,
+
     /// Path to the Python worker script or virtualenv executable
     #[arg(short, long, default_value = "python/braidpipe/worker.py")]
     python_script: PathBuf,
@@ -105,14 +110,46 @@ async fn run() -> Result<(), AppError> {
         None => args.sink.clone(),
     };
 
+    let audio_branch = if args.audio {
+        let branch = preset::audio_branch()?;
+        // The generated branch links two elements by name; make sure both
+        // exist before GStreamer fails with a much less helpful message. A
+        // BRAIDPIPE_AUDIO_BRANCH override may tap anything it likes.
+        if std::env::var("BRAIDPIPE_AUDIO_BRANCH").is_err() {
+            if args.uri.is_none()
+                && !args
+                    .source
+                    .as_deref()
+                    .is_some_and(|s| s.contains("name=decoder"))
+            {
+                return Err("--audio needs a source exposing audio: use --uri, or name \
+                            your demuxer/decodebin 'decoder' in --source"
+                    .into());
+            }
+            if args.output.is_none() && !sink.contains("name=mux") {
+                return Err("--audio needs a muxer to join: use --output, or name \
+                            your muxer 'mux' in --sink"
+                    .into());
+            }
+        }
+        info!(branch = %branch, "Audio passthrough enabled");
+        Some(branch)
+    } else {
+        None
+    };
+
     // 2. Initialize the Media Engine Adapter (GStreamer)
     info!("Constructing GStreamer dual-branch pipeline...");
     let engine = Arc::new(match args.uri.as_deref() {
         Some(uri) => {
             info!(%uri, "Creating pipeline from input URI");
-            GStreamerEngine::new_from_uri(uri, &sink)?
+            GStreamerEngine::new_from_uri(uri, &sink, audio_branch.as_deref())?
         }
-        None => GStreamerEngine::new(args.source.as_deref().unwrap_or(DEFAULT_SOURCE), &sink)?,
+        None => GStreamerEngine::new_with_branch(
+            args.source.as_deref().unwrap_or(DEFAULT_SOURCE),
+            &sink,
+            audio_branch.as_deref(),
+        )?,
     });
 
     if args.passthrough_only {
