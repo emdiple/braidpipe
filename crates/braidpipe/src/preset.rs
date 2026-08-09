@@ -1,0 +1,310 @@
+//! Named latency/bandwidth profiles that expand into a full encoder + sink
+//! description, the way ffmpeg's `-preset` expands into a bag of x264 options.
+//!
+//! A preset only decides defaults. Every parameter can be overridden through an
+//! environment variable, so a deployment can start from `lowlatency` and turn
+//! one knob without writing the whole GStreamer sink by hand:
+//!
+//!   BRAIDPIPE_ENCODER       x264 | vtenc
+//!   BRAIDPIPE_BITRATE_KBPS  encoder target bitrate
+//!   BRAIDPIPE_SPEED_PRESET  x264 speed preset (ultrafast..placebo)
+//!   BRAIDPIPE_ZEROLATENCY   1/0, x264 tune=zerolatency / vtenc realtime
+//!   BRAIDPIPE_GOP_SECONDS   keyframe interval in seconds
+//!   BRAIDPIPE_VBV_BUF_MS    x264 VBV buffer, bounds bitrate bursts
+//!   BRAIDPIPE_SINK_SYNC     1/0, clock-sync the network sink
+//!   BRAIDPIPE_SRT_LATENCY_MS  srtsink receive-side latency budget
+//!
+//! `--sink` still accepts a raw pipeline string and bypasses all of this.
+
+use std::fmt;
+
+/// Everything a profile decides. Latency falls and bandwidth rises from the
+/// bottom of this list to the top of the preset table below.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Params {
+    pub encoder: Encoder,
+    pub speed_preset: &'static str,
+    /// tune=zerolatency: no B-frames, no lookahead. Costs compression
+    /// efficiency, saves several frame times of encoder delay.
+    pub zerolatency: bool,
+    pub bitrate_kbps: u32,
+    pub gop_seconds: f64,
+    /// x264 VBV buffer in milliseconds. This is what makes the bitrate number
+    /// mean something on the wire: it bounds how far above the target the
+    /// encoder may burst, and how much encoded data a decoder must be ready
+    /// to buffer -- so it is both a bandwidth cap and hidden latency. x264's
+    /// own default (600 ms) allows bursts over half a second long.
+    pub vbv_buf_ms: u32,
+    /// sync=false on the sink. Measured worth ~48ms: a syncing network sink
+    /// holds each buffer until running-time + configured latency, and the live
+    /// source already paces the pipeline.
+    pub sync: bool,
+    pub srt_latency_ms: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoder {
+    X264,
+    Vtenc,
+}
+
+impl fmt::Display for Encoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Encoder::X264 => "x264",
+            Encoder::Vtenc => "vtenc",
+        })
+    }
+}
+
+pub const PRESET_NAMES: [&str; 4] = ["zerolatency", "lowlatency", "balanced", "bandwidth"];
+
+/// Profile defaults. Bitrates assume 720p30; override for other formats.
+fn defaults(preset: &str) -> Option<Params> {
+    let p = match preset {
+        // Every latency lever pulled, bandwidth pays for it.
+        "zerolatency" => Params {
+            encoder: Encoder::X264,
+            speed_preset: "ultrafast",
+            zerolatency: true,
+            bitrate_kbps: 6000,
+            gop_seconds: 1.0,
+            sync: false,
+            vbv_buf_ms: 100,
+            srt_latency_ms: 50,
+        },
+        // The measured sweet spot: keeps the ~40ms p50 of the tuned harness
+        // sink while veryfast claws back most of ultrafast's wasted bits.
+        "lowlatency" => Params {
+            encoder: Encoder::X264,
+            speed_preset: "veryfast",
+            zerolatency: true,
+            bitrate_kbps: 4500,
+            gop_seconds: 2.0,
+            sync: false,
+            vbv_buf_ms: 200,
+            srt_latency_ms: 125,
+        },
+        "balanced" => Params {
+            encoder: Encoder::X264,
+            speed_preset: "medium",
+            zerolatency: true,
+            bitrate_kbps: 3000,
+            gop_seconds: 2.0,
+            sync: false,
+            vbv_buf_ms: 500,
+            srt_latency_ms: 250,
+        },
+        // Minimum bits for the quality: B-frames and lookahead come back,
+        // which adds several frames of encoder delay by design.
+        "bandwidth" => Params {
+            encoder: Encoder::X264,
+            speed_preset: "slow",
+            zerolatency: false,
+            bitrate_kbps: 1800,
+            gop_seconds: 4.0,
+            sync: true,
+            vbv_buf_ms: 1000,
+            srt_latency_ms: 500,
+        },
+        _ => return None,
+    };
+    Some(p)
+}
+
+/// Builds the sink description for a preset and an output URL
+/// (rtmp://, srt:// or udp://host:port), env overrides applied.
+pub fn build_sink(preset: &str, output: &str, fps: u32) -> Result<String, String> {
+    let params = resolve(preset, |key| std::env::var(key).ok())?;
+    render(&params, output, fps)
+}
+
+/// Applies environment overrides on top of a preset's defaults. The lookup is
+/// injected so tests do not have to mutate process-global state.
+fn resolve(
+    preset: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Params, String> {
+    let mut p = defaults(preset).ok_or_else(|| {
+        format!(
+            "unknown preset '{preset}' (expected one of: {})",
+            PRESET_NAMES.join(", ")
+        )
+    })?;
+
+    if let Some(v) = env("BRAIDPIPE_ENCODER") {
+        p.encoder = match v.as_str() {
+            "x264" => Encoder::X264,
+            "vtenc" => Encoder::Vtenc,
+            other => return Err(format!("BRAIDPIPE_ENCODER must be x264 or vtenc, got '{other}'")),
+        };
+    }
+    if let Some(v) = env("BRAIDPIPE_SPEED_PRESET") {
+        // x264enc rejects bad values itself; leaking the string through keeps
+        // this file from shadowing the encoder's own vocabulary.
+        p.speed_preset = Box::leak(v.into_boxed_str());
+    }
+    if let Some(v) = env("BRAIDPIPE_ZEROLATENCY") {
+        p.zerolatency = parse_bool("BRAIDPIPE_ZEROLATENCY", &v)?;
+    }
+    if let Some(v) = env("BRAIDPIPE_BITRATE_KBPS") {
+        p.bitrate_kbps = parse_num("BRAIDPIPE_BITRATE_KBPS", &v)?;
+    }
+    if let Some(v) = env("BRAIDPIPE_GOP_SECONDS") {
+        p.gop_seconds = parse_num("BRAIDPIPE_GOP_SECONDS", &v)?;
+    }
+    if let Some(v) = env("BRAIDPIPE_VBV_BUF_MS") {
+        p.vbv_buf_ms = parse_num("BRAIDPIPE_VBV_BUF_MS", &v)?;
+    }
+    if let Some(v) = env("BRAIDPIPE_SINK_SYNC") {
+        p.sync = parse_bool("BRAIDPIPE_SINK_SYNC", &v)?;
+    }
+    if let Some(v) = env("BRAIDPIPE_SRT_LATENCY_MS") {
+        p.srt_latency_ms = parse_num("BRAIDPIPE_SRT_LATENCY_MS", &v)?;
+    }
+    Ok(p)
+}
+
+fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
+    let keyint = ((p.gop_seconds * f64::from(fps.max(1))).round() as u32).max(1);
+
+    let encoder = match p.encoder {
+        Encoder::X264 => {
+            let tune = if p.zerolatency { " tune=zerolatency" } else { "" };
+            format!(
+                "x264enc speed-preset={}{tune} bitrate={} key-int-max={keyint} \
+                 vbv-buf-capacity={}",
+                p.speed_preset, p.bitrate_kbps, p.vbv_buf_ms
+            )
+        }
+        Encoder::Vtenc => format!(
+            "vtenc_h264 realtime={} allow-frame-reordering={} bitrate={} \
+             max-keyframe-interval={keyint}",
+            p.zerolatency, !p.zerolatency, p.bitrate_kbps
+        ),
+    };
+
+    // The muxer is always named so an audio branch has something to link to
+    // by reference (`mux.`), whether generated by audio_branch() or written
+    // into a custom --sink by hand.
+    let sync = format!("sync={}", p.sync);
+    let mux_and_sink = if output.starts_with("rtmp://") {
+        format!("flvmux name=mux streamable=true ! rtmp2sink {sync} location={output}")
+    } else if output.starts_with("srt://") {
+        format!(
+            "mpegtsmux name=mux alignment=7 ! srtsink {sync} latency={} uri={output}",
+            p.srt_latency_ms
+        )
+    } else if let Some(rest) = output.strip_prefix("udp://") {
+        let (host, port) = rest
+            .rsplit_once(':')
+            .filter(|(h, p)| !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+            .ok_or_else(|| format!("udp output must be udp://host:port, got '{output}'"))?;
+        format!("mpegtsmux name=mux alignment=7 ! udpsink {sync} host={host} port={port}")
+    } else {
+        return Err(format!(
+            "unsupported output '{output}' (expected rtmp://, srt:// or udp://host:port)"
+        ));
+    };
+
+    // I420 pinned before the encoder: left to caps negotiation from the RGB
+    // the AI branch deals in, videoconvert offers 4:4:4 -- twice the samples
+    // for no benefit over these transports.
+    Ok(format!(
+        "videoconvert ! video/x-raw,format=I420 ! {encoder} ! \
+         h264parse config-interval=-1 ! {mux_and_sink}"
+    ))
+}
+
+fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        _ => Err(format!("{key} must be a boolean (1/0/true/false), got '{value}'")),
+    }
+}
+
+fn parse_num<T: std::str::FromStr>(key: &str, value: &str) -> Result<T, String> {
+    value
+        .parse()
+        .map_err(|_| format!("{key}: could not parse '{value}'"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn lowlatency_rtmp_matches_measured_tuned_sink() {
+        let p = resolve("lowlatency", no_env).unwrap();
+        let sink = render(&p, "rtmp://127.0.0.1:1935/live/stream", 30).unwrap();
+        assert_eq!(
+            sink,
+            "videoconvert ! video/x-raw,format=I420 ! \
+             x264enc speed-preset=veryfast tune=zerolatency bitrate=4500 key-int-max=60 \
+             vbv-buf-capacity=200 ! \
+             h264parse config-interval=-1 ! flvmux name=mux streamable=true ! \
+             rtmp2sink sync=false location=rtmp://127.0.0.1:1935/live/stream"
+        );
+    }
+
+    #[test]
+    fn bandwidth_preset_drops_zerolatency_and_keeps_sync() {
+        let p = resolve("bandwidth", no_env).unwrap();
+        let sink = render(&p, "rtmp://example/live", 30).unwrap();
+        assert!(!sink.contains("tune=zerolatency"));
+        assert!(sink.contains("sync=true"));
+        assert!(sink.contains("key-int-max=120"));
+        assert!(sink.contains("vbv-buf-capacity=1000"));
+    }
+
+    #[test]
+    fn env_overrides_win_over_preset_defaults() {
+        let p = resolve("lowlatency", |key| match key {
+            "BRAIDPIPE_BITRATE_KBPS" => Some("2500".into()),
+            "BRAIDPIPE_SINK_SYNC" => Some("1".into()),
+            "BRAIDPIPE_ENCODER" => Some("vtenc".into()),
+            "BRAIDPIPE_VBV_BUF_MS" => Some("350".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(p.bitrate_kbps, 2500);
+        assert_eq!(p.vbv_buf_ms, 350);
+        assert!(p.sync);
+        assert_eq!(p.encoder, Encoder::Vtenc);
+        let sink = render(&p, "rtmp://example/live", 30).unwrap();
+        assert!(sink.contains("vtenc_h264 realtime=true"));
+        assert!(sink.contains("sync=true"));
+    }
+
+    #[test]
+    fn srt_output_uses_mpegts_and_latency_budget() {
+        let p = resolve("zerolatency", no_env).unwrap();
+        let sink = render(&p, "srt://127.0.0.1:8888", 30).unwrap();
+        assert!(sink.contains("mpegtsmux name=mux alignment=7"));
+        assert!(sink.contains("srtsink sync=false latency=50 uri=srt://127.0.0.1:8888"));
+    }
+
+    #[test]
+    fn udp_output_splits_host_and_port() {
+        let p = resolve("lowlatency", no_env).unwrap();
+        let sink = render(&p, "udp://239.0.0.1:5000", 30).unwrap();
+        assert!(sink.contains("udpsink sync=false host=239.0.0.1 port=5000"));
+        assert!(render(&p, "udp://nohost", 30).is_err());
+    }
+
+    #[test]
+    fn unknown_preset_and_bad_env_are_reported() {
+        assert!(resolve("warpspeed", no_env)
+            .unwrap_err()
+            .contains("zerolatency, lowlatency, balanced, bandwidth"));
+        assert!(resolve("lowlatency", |key| {
+            (key == "BRAIDPIPE_ZEROLATENCY").then(|| "maybe".to_string())
+        })
+        .is_err());
+    }
+}

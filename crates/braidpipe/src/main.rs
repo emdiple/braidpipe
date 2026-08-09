@@ -1,3 +1,4 @@
+mod preset;
 mod relay;
 
 use braidpipe_core::fsm::Watchdog;
@@ -29,6 +30,16 @@ struct Args {
     /// GStreamer sink string (e.g., "autovideosink" or "srtsink uri=srt://127.0.0.1:8888")
     #[arg(short = 'o', long, default_value = "videoconvert ! autovideosink")]
     sink: String,
+
+    /// Output URL to publish to (rtmp://, srt:// or udp://host:port); builds the
+    /// encoder and sink from --preset instead of requiring a full --sink string
+    #[arg(long, value_name = "URL", conflicts_with = "sink")]
+    output: Option<String>,
+
+    /// Latency/bandwidth profile used with --output: zerolatency, lowlatency,
+    /// balanced or bandwidth. Individual parameters yield to BRAIDPIPE_* env vars
+    #[arg(long, default_value = "lowlatency", requires = "output")]
+    preset: String,
 
     /// Path to the Python worker script or virtualenv executable
     #[arg(short, long, default_value = "python/braidpipe/worker.py")]
@@ -85,14 +96,23 @@ async fn run() -> Result<(), AppError> {
     let args = Args::parse();
     info!("Starting braidpipe daemon...");
 
+    let sink = match args.output.as_deref() {
+        Some(output) => {
+            let desc = preset::build_sink(&args.preset, output, args.fps)?;
+            info!(preset = %args.preset, sink = %desc, "Built sink from preset");
+            desc
+        }
+        None => args.sink.clone(),
+    };
+
     // 2. Initialize the Media Engine Adapter (GStreamer)
     info!("Constructing GStreamer dual-branch pipeline...");
     let engine = Arc::new(match args.uri.as_deref() {
         Some(uri) => {
             info!(%uri, "Creating pipeline from input URI");
-            GStreamerEngine::new_from_uri(uri, &args.sink)?
+            GStreamerEngine::new_from_uri(uri, &sink)?
         }
-        None => GStreamerEngine::new(args.source.as_deref().unwrap_or(DEFAULT_SOURCE), &args.sink)?,
+        None => GStreamerEngine::new(args.source.as_deref().unwrap_or(DEFAULT_SOURCE), &sink)?,
     });
 
     if args.passthrough_only {
