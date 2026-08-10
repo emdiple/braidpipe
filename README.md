@@ -290,6 +290,7 @@ If the source has no audio stream, don't pass `--audio` — the audio branch wou
 | `--python-sock <PATH>` | `/tmp/braidpipe_python.sock` | Where the worker listens for notifications |
 | `--passthrough-only` | off | Media path only; no worker, no shared memory |
 | `--metrics-port <N>` | `9184` | Prometheus endpoint on 127.0.0.1, see [Monitoring](#monitoring); `0` disables |
+| `--metrics-drain-ms <N>` | `2000` | How long to keep serving metrics after a shutdown signal, so the down state gets scraped |
 
 `--width`/`--height` must match the frames your source actually produces after `videoscale`, because they define the slot size that both sides index into.
 
@@ -522,7 +523,15 @@ cd monitoring && docker compose up -d
 # Prometheus: http://localhost:9090
 ```
 
-It scrapes once a second and ships a provisioned dashboard (bandwidth, frame rates, latency percentiles against the deadline, branch state timeline, drops, backpressure, A/V skew, process usage, SRT transport) plus [alert rules](monitoring/prometheus/alerts.yml) for the conditions worth paging on: worker down, stuck in passthrough, output dark, >5% deadline misses, stale AI frames, A/V skew over 100 ms.
+It scrapes once a second and ships a provisioned dashboard (bandwidth, frame rates, latency percentiles against the deadline, branch state timeline, drops, backpressure, A/V skew, process usage, SRT transport) plus [alert rules](monitoring/prometheus/alerts.yml) for the conditions worth paging on: daemon unreachable, worker down, stuck in passthrough, output dark, >5% deadline misses, stale AI frames, A/V skew over 100 ms.
+
+### Shutdown and stale panels
+
+A metric that stops being scraped keeps its last value on screen, so a daemon that dies looks identical to one that is healthy and idle. Three things prevent that misreading:
+
+- **`braidpipe_up`** goes to `0` the moment a shutdown signal arrives, and the endpoint stays open for `--metrics-drain-ms` (default 2000, ≥ one scrape interval) so the down state is actually recorded before the process exits.
+- **The dashboard gates on the scrape**, not on the daemon's own metrics. The Daemon panel reads `up{job="braidpipe"}` — Prometheus writes that even when the target is gone — and the availability, worker, and fps panels are conditioned on it, so they blank or read DOWN rather than freezing on the last healthy sample. `BraidpipeDown` alerts on the same series, and is the only rule that can fire when the daemon no longer exists to report anything.
+- **Shutdown cannot hang.** Ctrl+C reaches the worker only when both share a terminal, so the daemon SIGTERMs it explicitly (SIGKILL after 2 s). Pipeline teardown is bounded by a guard that force-exits `--metrics-drain-ms` + 4 s after the signal: on macOS, `set_state(NULL)` on the GL video sink deadlocks against its own GL thread, and a daemon wedged there is the worst case of all — still alive, still serving, still reporting the last healthy sample.
 
 ## Troubleshooting
 
