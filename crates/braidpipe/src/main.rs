@@ -1,3 +1,4 @@
+mod metrics_server;
 mod preset;
 mod relay;
 
@@ -77,6 +78,10 @@ struct Args {
     /// Keep the stream on the passthrough branch without starting the Python worker
     #[arg(long)]
     passthrough_only: bool,
+
+    /// Port for the Prometheus /metrics endpoint on 127.0.0.1 (0 to disable)
+    #[arg(long, default_value_t = 9184)]
+    metrics_port: u16,
 }
 
 type AppError = Box<dyn std::error::Error + Send + Sync>;
@@ -154,6 +159,13 @@ async fn run() -> Result<(), AppError> {
 
     if args.passthrough_only {
         info!("Starting in passthrough-only mode");
+        let collector_engine = Arc::clone(&engine);
+        metrics_server::spawn(
+            args.metrics_port,
+            vec![Box::new(move |out| {
+                collector_engine.collect_runtime_metrics(out)
+            })],
+        );
         engine.start().await?;
         signal::ctrl_c().await?;
         engine.stop().await?;
@@ -204,19 +216,51 @@ async fn run() -> Result<(), AppError> {
 
     let child_pid = python_child.id().unwrap_or(0);
     info!(pid = child_pid, "Python worker active");
+    braidpipe_core::metrics::WORKER_UP.set(1);
+    metrics_server::spawn_worker_sampler(child_pid);
 
-    // 7. Instantiate the Watchdog FSM with injected Adapters
+    // 7. Expose the Prometheus endpoint, with collectors for the live state
+    // the static registry cannot see: pipeline queues / SRT stats, and the
+    // SHM ring occupancy.
+    let collector_engine = Arc::clone(&engine);
+    let collector_shm = Arc::clone(&shm_buffer);
+    metrics_server::spawn(
+        args.metrics_port,
+        vec![
+            Box::new(move |out| collector_engine.collect_runtime_metrics(out)),
+            Box::new(move |out| {
+                use std::fmt::Write;
+                let (occupied, total) = collector_shm.occupied_slots();
+                let _ = writeln!(
+                    out,
+                    "# HELP braidpipe_shm_slots_occupied Ring slots currently holding a frame\n\
+                     # TYPE braidpipe_shm_slots_occupied gauge\n\
+                     braidpipe_shm_slots_occupied {occupied}\n\
+                     # TYPE braidpipe_shm_slots gauge\n\
+                     braidpipe_shm_slots {total}"
+                );
+            }),
+        ],
+    );
+
+    // 8. Instantiate the Watchdog FSM with injected Adapters
     let mut watchdog = Watchdog::new(engine, ai_bridge, args.fps);
 
-    // 8. Spawn a background task to supervise the Python process handle
+    // 9. Spawn a background task to supervise the Python process handle
     tokio::spawn(async move {
         match python_child.wait().await {
-            Ok(status) => warn!(status = %status, "Python worker process exited"),
+            Ok(status) => {
+                warn!(status = %status, "Python worker process exited");
+                braidpipe_core::metrics::WORKER_UP.set(0);
+                braidpipe_core::metrics::WORKER_EXITS.inc();
+                braidpipe_core::metrics::WORKER_LAST_EXIT_CODE
+                    .set(i64::from(status.code().unwrap_or(-1)));
+            }
             Err(e) => error!(error = %e, "Error waiting on Python process handle"),
         }
     });
 
-    // 9. Hand execution to the Watchdog event loop (Blocks until SIGINT/SIGTERM)
+    // 10. Hand execution to the Watchdog event loop (Blocks until SIGINT/SIGTERM)
     info!("System initialized. Handing off execution to Watchdog FSM...");
     watchdog.run_loop().await;
 
