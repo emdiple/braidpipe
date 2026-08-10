@@ -82,6 +82,11 @@ struct Args {
     /// Port for the Prometheus /metrics endpoint on 127.0.0.1 (0 to disable)
     #[arg(long, default_value_t = 9184)]
     metrics_port: u16,
+
+    /// Milliseconds to keep serving metrics after shutdown starts, so the
+    /// scrape that records the daemon as down actually happens (0 to exit at once)
+    #[arg(long, default_value_t = 2000)]
+    metrics_drain_ms: u64,
 }
 
 type AppError = Box<dyn std::error::Error + Send + Sync>;
@@ -166,9 +171,14 @@ async fn run() -> Result<(), AppError> {
                 collector_engine.collect_runtime_metrics(out)
             })],
         );
+        braidpipe_core::metrics::UP.set(1);
+        metrics_server::spawn_shutdown_guard(args.metrics_drain_ms + 4000);
         engine.start().await?;
         signal::ctrl_c().await?;
+        info!("Shutdown signal received");
+        braidpipe_core::metrics::UP.set(0);
         engine.stop().await?;
+        metrics_server::drain(args.metrics_port, args.metrics_drain_ms).await;
         return Ok(());
     }
 
@@ -242,11 +252,25 @@ async fn run() -> Result<(), AppError> {
             }),
         ],
     );
+    braidpipe_core::metrics::UP.set(1);
 
-    // 8. Instantiate the Watchdog FSM with injected Adapters
+    // 8. React to the shutdown signal here as well as in the FSM. The FSM
+    // breaks its loop and tears the pipeline down, which can block for a long
+    // time; the observable state and the worker must not wait on that. The
+    // guard is the backstop for a teardown that never returns at all.
+    tokio::spawn(async move {
+        if signal::ctrl_c().await.is_err() {
+            return;
+        }
+        braidpipe_core::metrics::UP.set(0);
+        metrics_server::terminate_worker(child_pid, 2000).await;
+    });
+    metrics_server::spawn_shutdown_guard(args.metrics_drain_ms + 4000);
+
+    // 9. Instantiate the Watchdog FSM with injected Adapters
     let mut watchdog = Watchdog::new(engine, ai_bridge, args.fps);
 
-    // 9. Spawn a background task to supervise the Python process handle
+    // 10. Spawn a background task to supervise the Python process handle
     tokio::spawn(async move {
         match python_child.wait().await {
             Ok(status) => {
@@ -260,9 +284,15 @@ async fn run() -> Result<(), AppError> {
         }
     });
 
-    // 10. Hand execution to the Watchdog event loop (Blocks until SIGINT/SIGTERM)
+    // 11. Hand execution to the Watchdog event loop (Blocks until SIGINT/SIGTERM)
     info!("System initialized. Handing off execution to Watchdog FSM...");
     watchdog.run_loop().await;
+
+    // 12. Graceful shutdown. Ctrl+C reaches the worker too when both share a
+    // terminal, but not when the daemon is supervised, so stop it explicitly;
+    // then hold the endpoint open until the down state has been scraped.
+    metrics_server::terminate_worker(child_pid, 2000).await;
+    metrics_server::drain(args.metrics_port, args.metrics_drain_ms).await;
 
     Ok(())
 }

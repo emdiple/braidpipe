@@ -156,6 +156,11 @@ impl Histogram {
 
 // --- The registry. Grouped the way the dashboard groups them. ---
 
+// Daemon liveness. 1 while the daemon is streaming, flipped to 0 during a
+// graceful shutdown so the last scrape before exit reports the true state
+// instead of leaving the dashboard frozen on the final running sample.
+pub static UP: Gauge = Gauge::new(0);
+
 // Frame outcomes and latency (updated by the relay)
 pub static FRAMES_AI: Counter = Counter::new();
 pub static FRAMES_PASSTHROUGH: Counter = Counter::new();
@@ -229,6 +234,8 @@ pub fn render(out: &mut String) {
             let _ = writeln!(out, "{} {}", $name, $value);
         };
     }
+
+    gauge!("braidpipe_up", "1 while the daemon is streaming, 0 once it starts shutting down", UP.get());
 
     counter!("braidpipe_frames_total", "Frames pushed downstream by the relay, by outcome",
         "{outcome=\"ai\"}" => FRAMES_AI, "{outcome=\"passthrough\"}" => FRAMES_PASSTHROUGH);

@@ -162,6 +162,66 @@ pub fn spawn_worker_sampler(pid: u32) {
     });
 }
 
+/// Marks the daemon down and keeps serving long enough for Prometheus to
+/// scrape that final state.
+///
+/// Without this the process disappears between scrapes and the last sample
+/// Prometheus ever saw is a healthy one, so every dashboard panel freezes on
+/// "worker up, AI available" forever. `drain_ms` should span at least one
+/// scrape interval; a scrape lands mid-drain and records the truth.
+pub async fn drain(port: u16, drain_ms: u64) {
+    metrics::UP.set(0);
+    metrics::WORKER_HEALTHY.set(0);
+    if port == 0 || drain_ms == 0 {
+        return;
+    }
+    info!(drain_ms, "Holding the metrics endpoint open so the final state is scraped");
+    tokio::time::sleep(Duration::from_millis(drain_ms)).await;
+}
+
+/// Force-exits if a shutdown has not finished `deadline_ms` after the signal.
+///
+/// Tearing down a GStreamer pipeline can block indefinitely -- macOS video
+/// sinks deadlock on `set_state(NULL)` while their GL thread holds the element
+/// lock. A daemon wedged in that state is the worst outcome: still alive,
+/// still answering scrapes, still reporting the last healthy sample. This
+/// guarantees the process actually goes away.
+pub fn spawn_shutdown_guard(deadline_ms: u64) {
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(deadline_ms)).await;
+        warn!(deadline_ms, "Shutdown did not complete in time; forcing exit");
+        std::process::exit(0);
+    });
+}
+
+/// Stops the worker and waits for the supervisor task to observe its exit.
+///
+/// SIGTERM first so the worker can release its SHM mapping and socket; SIGKILL
+/// only if it is still alive after `grace_ms`.
+pub async fn terminate_worker(pid: u32, grace_ms: u64) {
+    if pid == 0 || metrics::WORKER_UP.get() == 0 {
+        return;
+    }
+    info!(pid, "Stopping the Python worker");
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
+    while tokio::time::Instant::now() < deadline {
+        if metrics::WORKER_UP.get() == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    warn!(pid, "Worker did not exit on SIGTERM; sending SIGKILL");
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    metrics::WORKER_UP.set(0);
+}
+
 /// Parses ps cputime: `[[dd-]hh:]mm:ss[.cc]`.
 fn parse_cputime(text: &str) -> Option<f64> {
     let (days, rest) = match text.split_once('-') {
