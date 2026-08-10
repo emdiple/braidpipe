@@ -7,6 +7,7 @@
 //! through unchanged, so the output stream never goes dark even while the
 //! Watchdog still has the AI branch selected.
 
+use braidpipe_core::metrics;
 use braidpipe_core::ports::ai::{AiBridge, IpcError, ShmWriter};
 use braidpipe_ipc::shm::ShmRingBuffer;
 use braidpipe_ipc::uds::UdsControlBridge;
@@ -55,12 +56,15 @@ pub fn spawn(
                     // try_send: if the relay is still busy with the previous
                     // frame, drop this one instead of blocking the streaming
                     // thread.
-                    let _ = tx.try_send(RawFrame {
+                    let sent = tx.try_send(RawFrame {
                         data: map.as_slice().to_vec(),
                         pts: buffer.pts(),
                         duration: buffer.duration(),
                         caps: sample.caps().map(|c| c.to_owned()),
                     });
+                    if sent.is_err() {
+                        metrics::RELAY_CHANNEL_DROPS.inc();
+                    }
                 }
                 Ok(gst::FlowSuccess::Ok)
             })
@@ -69,6 +73,7 @@ pub fn spawn(
 
     // Allow 1.5 frame periods for the full SHM + UDS roundtrip
     let deadline = Duration::from_secs_f64(1.5 / f64::from(fps.max(1)));
+    metrics::RELAY_DEADLINE_SECONDS.set(deadline.as_secs_f64());
 
     info!(
         width,
@@ -96,10 +101,19 @@ async fn relay_loop(
         // holds the original pixels, which then pass through unchanged.
         let mut data = frame.data;
 
+        let started = Instant::now();
         match roundtrip(&shm, &bridge, frame_id, &mut data, deadline).await {
-            Ok(()) => bridge.record_success(),
+            Ok(processing_us) => {
+                bridge.record_success();
+                metrics::FRAMES_AI.inc();
+                metrics::ROUNDTRIP_SECONDS.observe_seconds(started.elapsed().as_secs_f64());
+                metrics::WORKER_PROCESSING_SECONDS
+                    .observe_seconds(processing_us as f64 / 1e6);
+                metrics::LAST_AI_FRAME_TIMESTAMP.set(metrics::unix_now());
+            }
             Err(error) => {
                 bridge.record_failure();
+                metrics::FRAMES_PASSTHROUGH.inc();
                 debug!(%error, frame_id, "AI roundtrip failed; passing frame through unchanged");
             }
         }
@@ -123,15 +137,18 @@ async fn relay_loop(
 }
 
 /// Writes a frame to SHM, signals Python, and waits for the matching ack.
-/// On success `data` is overwritten with the processed pixels.
+/// On success `data` is overwritten with the processed pixels, and the
+/// worker's self-reported processing time (µs) is returned.
 async fn roundtrip(
     shm: &ShmRingBuffer,
     bridge: &UdsControlBridge,
     frame_id: u64,
     data: &mut [u8],
     deadline: Duration,
-) -> Result<(), IpcError> {
-    let meta = shm.write_frame(frame_id, data)?;
+) -> Result<u64, IpcError> {
+    let meta = shm.write_frame(frame_id, data).inspect_err(|_| {
+        metrics::SHM_FULL.inc();
+    })?;
 
     let result = notify_and_await(shm, bridge, meta, data, deadline).await;
     if result.is_err() {
@@ -148,7 +165,7 @@ async fn notify_and_await(
     meta: braidpipe_core::ports::ai::FrameMetadata,
     data: &mut [u8],
     deadline: Duration,
-) -> Result<(), IpcError> {
+) -> Result<u64, IpcError> {
     let frame_id = meta.frame_id;
     let slot_index = meta.slot_index;
     bridge.notify_frame_ready(meta).await?;
@@ -162,10 +179,13 @@ async fn notify_and_await(
         let ack = bridge.await_processed_frame(remaining).await?;
         if ack.frame_id == frame_id {
             shm.read_frame(slot_index, data)?;
-            return Ok(());
+            // The bridge hands the ack's processing_time_us back through the
+            // metadata's timestamp field.
+            return Ok(ack.timestamp_us);
         }
 
         // A stale ack from a previously timed-out frame; keep waiting
+        metrics::STALE_ACKS.inc();
         debug!(
             stale_id = ack.frame_id,
             expected_id = frame_id,

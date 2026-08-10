@@ -64,11 +64,13 @@ impl UdsControlBridge {
     /// Called by the frame relay after a successful Python roundtrip
     pub fn record_success(&self) {
         self.failure_streak.store(0, Ordering::Relaxed);
+        braidpipe_core::metrics::FAILURE_STREAK.set(0);
     }
 
     /// Called by the frame relay when Python misses a deadline or errors
     pub fn record_failure(&self) {
-        self.failure_streak.fetch_add(1, Ordering::Relaxed);
+        let streak = self.failure_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        braidpipe_core::metrics::FAILURE_STREAK.set(i64::from(streak));
     }
 }
 
@@ -136,7 +138,9 @@ impl AiBridge for UdsControlBridge {
     async fn is_healthy(&self) -> bool {
         // The worker must both be listening on its socket AND keeping up with
         // the frame deadlines (a stale socket file survives a SIGKILL).
-        self.python_sock_path.exists()
-            && self.failure_streak.load(Ordering::Relaxed) < MAX_FAILURE_STREAK
+        let healthy = self.python_sock_path.exists()
+            && self.failure_streak.load(Ordering::Relaxed) < MAX_FAILURE_STREAK;
+        braidpipe_core::metrics::WORKER_HEALTHY.set(i64::from(healthy));
+        healthy
     }
 }

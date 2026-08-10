@@ -1,9 +1,15 @@
+use braidpipe_core::metrics;
 use braidpipe_core::ports::media::{ActiveBranch, EngineError, StreamController};
 use gstreamer::prelude::*;
 use gstreamer_app::{AppSink, AppSrc};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tracing::{error, info, warn};
+
+/// Encoders whose src pads carry a meaningful DELTA_UNIT flag for keyframe
+/// counting. A whitelist, because "name contains enc" would match audio.
+const VIDEO_ENCODER_FACTORIES: [&str; 4] = ["x264enc", "vtenc_h264", "openh264enc", "vp9enc"];
 
 pub struct GStreamerEngine {
     pipeline: gstreamer::Pipeline,
@@ -12,6 +18,10 @@ pub struct GStreamerEngine {
     pad_ai: gstreamer::Pad,
     current_branch: Arc<Mutex<ActiveBranch>>,
     is_running: AtomicBool,
+    /// Handles polled at metrics-scrape time, cached so a scrape never has to
+    /// walk the pipeline: the two branch queues and any SRT elements.
+    metric_queues: Vec<(&'static str, gstreamer::Element)>,
+    srt_elements: Vec<gstreamer::Element>,
 }
 
 impl GStreamerEngine {
@@ -82,6 +92,8 @@ impl GStreamerEngine {
             .static_pad("sink_1")
             .ok_or_else(|| EngineError::BuildFailed("Missing sink_1 pad".into()))?;
 
+        let (metric_queues, srt_elements) = Self::attach_metrics(&pipeline, &input_selector);
+
         Ok(Self {
             pipeline,
             input_selector,
@@ -89,7 +101,245 @@ impl GStreamerEngine {
             pad_ai,
             current_branch: Arc::new(Mutex::new(ActiveBranch::Passthrough)),
             is_running: AtomicBool::new(false),
+            metric_queues,
+            srt_elements,
         })
+    }
+
+    /// Wires the pipeline into the metrics registry: pad probes for frame
+    /// counting and timestamps, overrun signals on the branch queues, and
+    /// cached handles for the values polled at scrape time. Every hook here is
+    /// optional -- a pipeline without an encoder, muxer or SRT element simply
+    /// produces fewer metrics.
+    fn attach_metrics(
+        pipeline: &gstreamer::Pipeline,
+        input_selector: &gstreamer::Element,
+    ) -> (
+        Vec<(&'static str, gstreamer::Element)>,
+        Vec<gstreamer::Element>,
+    ) {
+        // Input side: every frame the source delivers, its arrival jitter,
+        // timestamp sanity, and the negotiated caps.
+        if let Some(pad) = pipeline
+            .by_name("t")
+            .and_then(|tee| tee.static_pad("sink"))
+        {
+            let state: Mutex<(Option<Instant>, Option<gstreamer::ClockTime>)> =
+                Mutex::new((None, None));
+            pad.add_probe(
+                gstreamer::PadProbeType::BUFFER | gstreamer::PadProbeType::EVENT_DOWNSTREAM,
+                move |_, info| {
+                    match &info.data {
+                        Some(gstreamer::PadProbeData::Buffer(buffer)) => {
+                            metrics::INPUT_FRAMES.inc();
+                            let mut state = state.lock().unwrap();
+                            let now = Instant::now();
+                            if let Some(previous) = state.0.replace(now) {
+                                metrics::INPUT_INTERVAL_SECONDS
+                                    .observe_seconds((now - previous).as_secs_f64());
+                            }
+                            if let Some(pts) = buffer.pts() {
+                                if let Some(last) = state.1 {
+                                    // Backwards is always wrong; forwards is a
+                                    // discontinuity once the gap passes 1.75x
+                                    // the frame duration (when known).
+                                    let gapped = buffer.duration().is_some_and(|d| {
+                                        pts.nseconds()
+                                            > last.nseconds() + d.nseconds() * 7 / 4
+                                    });
+                                    if pts < last || gapped {
+                                        metrics::PTS_DISCONTINUITIES.inc();
+                                    }
+                                }
+                                state.1 = Some(pts);
+                            }
+                        }
+                        Some(gstreamer::PadProbeData::Event(event)) => {
+                            if let gstreamer::EventView::Caps(caps) = event.view()
+                                && let Some(s) = caps.caps().structure(0)
+                            {
+                                if let Ok(width) = s.get::<i32>("width") {
+                                    metrics::INPUT_WIDTH.set(i64::from(width));
+                                }
+                                if let Ok(height) = s.get::<i32>("height") {
+                                    metrics::INPUT_HEIGHT.set(i64::from(height));
+                                }
+                                if let Ok(fps) = s.get::<gstreamer::Fraction>("framerate")
+                                    && fps.denom() != 0
+                                {
+                                    metrics::INPUT_FPS
+                                        .set(f64::from(fps.numer()) / f64::from(fps.denom()));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    gstreamer::PadProbeReturn::Ok
+                },
+            );
+        }
+
+        // Output side: frames actually leaving the selector toward the sink.
+        if let Some(pad) = input_selector.static_pad("src") {
+            pad.add_probe(gstreamer::PadProbeType::BUFFER, |_, _| {
+                metrics::OUTPUT_FRAMES.inc();
+                gstreamer::PadProbeReturn::Ok
+            });
+        }
+
+        let mut srt_elements = Vec::new();
+        for element in pipeline.iterate_elements().into_iter().flatten() {
+            let Some(factory) = element.factory() else {
+                continue;
+            };
+            let factory = factory.name();
+
+            // Keyframe cadence, at the encoder's output where the DELTA_UNIT
+            // flag is authoritative (post-mux, audio tags would pollute it).
+            if VIDEO_ENCODER_FACTORIES.contains(&factory.as_str())
+                && let Some(pad) = element.static_pad("src") {
+                    pad.add_probe(gstreamer::PadProbeType::BUFFER, |_, info| {
+                        if let Some(gstreamer::PadProbeData::Buffer(buffer)) = &info.data
+                            && !buffer.flags().contains(gstreamer::BufferFlags::DELTA_UNIT)
+                        {
+                            metrics::KEYFRAMES.inc();
+                        }
+                        gstreamer::PadProbeReturn::Ok
+                    });
+                }
+
+            if factory == "srtsink" || factory == "srtsrc" {
+                srt_elements.push(element.clone());
+            }
+        }
+
+        // Wire bytes: whatever finally leaves the process. Every terminal
+        // element except the AI tap (an appsink of our own) counts.
+        for sink in pipeline.iterate_sinks().into_iter().flatten() {
+            if sink.name() == "ai_sink" {
+                continue;
+            }
+            if let Some(pad) = sink.static_pad("sink") {
+                pad.add_probe(gstreamer::PadProbeType::BUFFER, |_, info| {
+                    if let Some(gstreamer::PadProbeData::Buffer(buffer)) = &info.data {
+                        metrics::SINK_BYTES.add(buffer.size() as u64);
+                        metrics::SINK_BUFFERS.inc();
+                    }
+                    gstreamer::PadProbeReturn::Ok
+                });
+            }
+        }
+
+        // A/V skew: last PTS of each stream entering the muxer. The audio pad
+        // usually appears later (delayed linking from the decoder), so watch
+        // pad-added as well as the pads that already exist.
+        if let Some(mux) = pipeline.by_name("mux") {
+            for pad in mux.sink_pads() {
+                Self::attach_mux_pts_probe(&pad);
+            }
+            mux.connect_pad_added(|_, pad| {
+                if pad.direction() == gstreamer::PadDirection::Sink {
+                    Self::attach_mux_pts_probe(pad);
+                }
+            });
+        }
+
+        // Drop events on the branch queues. For a leaky queue, overrun is the
+        // moment an old buffer is discarded to admit a new one.
+        let mut metric_queues = Vec::new();
+        for (name, counter) in [
+            ("q_pass", &metrics::QUEUE_OVERRUNS_PASS),
+            ("q_ai", &metrics::QUEUE_OVERRUNS_AI),
+        ] {
+            if let Some(queue) = pipeline.by_name(name) {
+                let counter: &'static metrics::Counter = counter;
+                queue.connect("overrun", false, move |_| {
+                    counter.inc();
+                    None
+                });
+                metric_queues.push((name, queue));
+            }
+        }
+
+        (metric_queues, srt_elements)
+    }
+
+    fn attach_mux_pts_probe(pad: &gstreamer::Pad) {
+        // 0 = undetermined (caps not negotiated yet), 1 = video, 2 = audio,
+        // 3 = neither; resolved lazily on the first buffers.
+        let kind = AtomicU8::new(0);
+        pad.add_probe(gstreamer::PadProbeType::BUFFER, move |pad, info| {
+            let Some(gstreamer::PadProbeData::Buffer(buffer)) = &info.data else {
+                return gstreamer::PadProbeReturn::Ok;
+            };
+            let mut k = kind.load(Ordering::Relaxed);
+            if k == 0
+                && let Some(caps) = pad.current_caps()
+                    && let Some(s) = caps.structure(0)
+                {
+                    k = if s.name().starts_with("video/") {
+                        1
+                    } else if s.name().starts_with("audio/") {
+                        2
+                    } else {
+                        3
+                    };
+                    kind.store(k, Ordering::Relaxed);
+                }
+            // Raw PTS at a muxer is not comparable across pads: video
+            // encoders shift timestamps by a large constant (1000 hours) to
+            // keep DTS non-negative. Running time through the pad's segment
+            // is the shared clock both streams actually mux on.
+            let running_time = buffer.pts().and_then(|pts| {
+                pad.sticky_event::<gstreamer::event::Segment>(0)?
+                    .segment()
+                    .downcast_ref::<gstreamer::ClockTime>()?
+                    .to_running_time(pts)
+            });
+            if let Some(rt) = running_time {
+                let us = (rt.nseconds() / 1000) as i64;
+                match k {
+                    1 => metrics::LAST_VIDEO_PTS_US.store(us, Ordering::Relaxed),
+                    2 => metrics::LAST_AUDIO_PTS_US.store(us, Ordering::Relaxed),
+                    _ => {}
+                }
+            }
+            gstreamer::PadProbeReturn::Ok
+        });
+    }
+
+    /// Appends the metrics that only exist as live pipeline state: branch
+    /// queue depths and, when an SRT element is present, its transport
+    /// statistics. Called by the metrics endpoint on every scrape.
+    pub fn collect_runtime_metrics(&self, out: &mut String) {
+        use std::fmt::Write;
+
+        if !self.metric_queues.is_empty() {
+            let _ = writeln!(
+                out,
+                "# HELP braidpipe_queue_depth Buffers currently held per branch queue\n\
+                 # TYPE braidpipe_queue_depth gauge"
+            );
+            for (name, queue) in &self.metric_queues {
+                let depth = queue.property::<u32>("current-level-buffers");
+                let _ = writeln!(out, "braidpipe_queue_depth{{queue=\"{name}\"}} {depth}");
+            }
+        }
+
+        for element in &self.srt_elements {
+            let stats = element.property::<gstreamer::Structure>("stats");
+            let element_name = element.name();
+            for (field, value) in stats.iter() {
+                let Some(value) = value_as_f64(value) else {
+                    continue;
+                };
+                let metric = field.replace('-', "_");
+                let _ = writeln!(
+                    out,
+                    "braidpipe_srt_{metric}{{element=\"{element_name}\"}} {value}"
+                );
+            }
+        }
     }
 
     /// Builds a video source from a URI using GStreamer's URI source selection and decodebin3.
@@ -147,6 +397,19 @@ impl GStreamerEngine {
     }
 }
 
+/// SRT stats structures mix numeric types freely (rates are doubles, packet
+/// counts are various integer widths); anything numeric becomes a metric and
+/// everything else (caller lists, strings) is skipped.
+fn value_as_f64(value: &gstreamer::glib::SendValue) -> Option<f64> {
+    value
+        .get::<f64>()
+        .ok()
+        .or_else(|| value.get::<i32>().ok().map(f64::from))
+        .or_else(|| value.get::<u32>().ok().map(f64::from))
+        .or_else(|| value.get::<i64>().ok().map(|v| v as f64))
+        .or_else(|| value.get::<u64>().ok().map(|v| v as f64))
+}
+
 impl StreamController for GStreamerEngine {
     async fn set_active_branch(&self, branch: ActiveBranch) -> Result<(), EngineError> {
         let target_pad = match branch {
@@ -176,12 +439,16 @@ impl StreamController for GStreamerEngine {
                 use gstreamer::MessageView;
                 for msg in bus.iter_timed(gstreamer::ClockTime::NONE) {
                     match msg.view() {
-                        MessageView::Error(err) => error!(
-                            source = ?err.src().map(|s| s.path_string()),
-                            error = %err.error(),
-                            debug = ?err.debug(),
-                            "GStreamer pipeline error"
-                        ),
+                        MessageView::Error(err) => {
+                            metrics::BUS_ERRORS.inc();
+                            error!(
+                                source = ?err.src().map(|s| s.path_string()),
+                                error = %err.error(),
+                                debug = ?err.debug(),
+                                "GStreamer pipeline error"
+                            );
+                        }
+                        MessageView::Warning(_) => metrics::BUS_WARNINGS.inc(),
                         MessageView::Eos(_) => {
                             warn!("GStreamer pipeline reached end-of-stream");
                             break;

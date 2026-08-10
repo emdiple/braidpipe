@@ -165,6 +165,26 @@ impl ShmRingBuffer {
         self.header.slot_size as usize - std::mem::size_of::<SlotHeader>()
     }
 
+    /// Number of ring slots currently holding a frame (any state but FREE).
+    /// A snapshot for monitoring: slots move under the reader's feet, and a
+    /// momentarily stale count is fine for a gauge.
+    pub fn occupied_slots(&self) -> (u8, u8) {
+        let header_size = std::mem::size_of::<ShmHeader>();
+        let mut occupied = 0;
+        for i in 0..self.header.slot_count {
+            let slot_offset = header_size + (i as usize * self.header.slot_size as usize);
+            let state = unsafe {
+                (*(self.mmap_ptr.add(slot_offset) as *const SlotHeader))
+                    .state
+                    .load(Ordering::Acquire)
+            };
+            if state != SLOT_FREE {
+                occupied += 1;
+            }
+        }
+        (occupied, self.header.slot_count)
+    }
+
     /// Copies the pixel payload of a slot back out of shared memory.
     /// Called after Python acknowledges a processed frame.
     pub fn read_frame(&self, slot_index: u8, out: &mut [u8]) -> Result<(), IpcError> {

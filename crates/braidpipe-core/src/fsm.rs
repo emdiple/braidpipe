@@ -1,7 +1,8 @@
+use crate::metrics;
 use crate::ports::ai::AiBridge;
 use crate::ports::media::{ActiveBranch, StreamController};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::{self, MissedTickBehavior};
 use tracing::{error, info, warn};
 
@@ -39,13 +40,27 @@ where
         let mut ticker = time::interval(self.health_check_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+        // Wall time attributed to whichever branch was active since the last
+        // tick; measured rather than assumed, since skipped ticks stretch it.
+        let mut last_tick = Instant::now();
+
         loop {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     info!("Shutdown signal received");
                     break;
                 }
-                _ = ticker.tick() => self.update_active_branch().await,
+                _ = ticker.tick() => {
+                    let elapsed = last_tick.elapsed().as_secs_f64();
+                    last_tick = Instant::now();
+                    match self.media.current_branch() {
+                        ActiveBranch::AiProcess => metrics::BRANCH_SECONDS_AI.add_seconds(elapsed),
+                        ActiveBranch::Passthrough => {
+                            metrics::BRANCH_SECONDS_PASSTHROUGH.add_seconds(elapsed)
+                        }
+                    }
+                    self.update_active_branch().await;
+                }
             }
         }
 
@@ -67,6 +82,18 @@ where
 
         if let Err(error) = self.media.set_active_branch(target_branch).await {
             warn!(%error, ?target_branch, "Unable to switch active stream branch");
+            return;
+        }
+
+        match target_branch {
+            ActiveBranch::AiProcess => {
+                metrics::BRANCH_SWITCHES_TO_AI.inc();
+                metrics::ACTIVE_BRANCH.set(1);
+            }
+            ActiveBranch::Passthrough => {
+                metrics::BRANCH_SWITCHES_TO_PASSTHROUGH.inc();
+                metrics::ACTIVE_BRANCH.set(0);
+            }
         }
     }
 }
