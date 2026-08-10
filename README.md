@@ -54,6 +54,7 @@ The `input-selector` decides, frame by frame, whether the viewer sees the AI bra
 - [The IPC contract](#the-ipc-contract)
 - [Testing failover](#testing-failover)
 - [Measuring latency](#measuring-latency)
+- [Monitoring](#monitoring)
 - [Troubleshooting](#troubleshooting)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -288,6 +289,7 @@ If the source has no audio stream, don't pass `--audio` — the audio branch wou
 | `--rust-sock <PATH>` | `/tmp/braidpipe_rust.sock` | Where the daemon listens for acks |
 | `--python-sock <PATH>` | `/tmp/braidpipe_python.sock` | Where the worker listens for notifications |
 | `--passthrough-only` | off | Media path only; no worker, no shared memory |
+| `--metrics-port <N>` | `9184` | Prometheus endpoint on 127.0.0.1, see [Monitoring](#monitoring); `0` disables |
 
 `--width`/`--height` must match the frames your source actually produces after `videoscale`, because they define the slot size that both sides index into.
 
@@ -494,6 +496,34 @@ arrival interval  min= 16.30  p50= 33.33  p90= 35.49  p99= 37.87  max= 38.18  (m
 
 Every stamped frame is gone — the AI branch never made its deadline once — and the output still arrives at a 33.33 ms median, which is 30 fps exactly. Nothing downstream could tell the worker had failed.
 
+## Monitoring
+
+The daemon serves Prometheus metrics on `http://127.0.0.1:9184/metrics` (change with `--metrics-port`, `0` disables). Most of the numbers were already being measured for the failover logic — the endpoint makes them visible: every ack carries the worker's processing time, the relay times every roundtrip, the bridge counts the failure streak. The instrumentation adds nothing to the frame path beyond lock-free counter increments.
+
+What you get, by the question it answers:
+
+| Question | Metrics |
+| --- | --- |
+| Is the AI output live *right now*? | `braidpipe_last_ai_frame_timestamp_seconds`, `braidpipe_active_branch`, `braidpipe_worker_up` |
+| What's our availability? | `braidpipe_branch_seconds_total{branch}`, `braidpipe_branch_switches_total{direction}` |
+| Is trouble coming? | `braidpipe_queue_depth`, `braidpipe_shm_slots_occupied`, `braidpipe_failure_streak`, `braidpipe_stale_acks_total`, roundtrip p99 vs `braidpipe_relay_deadline_seconds` |
+| How fast is the worker? | `braidpipe_roundtrip_seconds` and `braidpipe_worker_processing_seconds` histograms |
+| Is the stream healthy? | `braidpipe_input_fps`, `braidpipe_pts_discontinuities_total`, `braidpipe_av_skew_seconds`, `braidpipe_keyframes_total`, `braidpipe_bus_messages_total` |
+| What's on the wire? | `braidpipe_sink_bytes_total`, `braidpipe_output_frames_total`, and full `braidpipe_srt_*` transport stats (RTT, loss, retransmits) when the pipeline has an SRT element |
+| Are the processes healthy? | `process_*` for the daemon, `braidpipe_worker_cpu_seconds_total` / `braidpipe_worker_resident_memory_bytes` for the worker, `braidpipe_worker_exits_total` |
+
+The A/V skew gauge is the audio-sync claim from [Audio passthrough](#audio-passthrough), continuously verified in production: both streams' running time at the muxer, subtracted.
+
+A ready-made Grafana stack lives in [monitoring/](monitoring/):
+
+```bash
+cd monitoring && docker compose up -d
+# Grafana: http://localhost:3000  (provisioned dashboard, no login)
+# Prometheus: http://localhost:9090
+```
+
+It scrapes once a second and ships a provisioned dashboard (bandwidth, frame rates, latency percentiles against the deadline, branch state timeline, drops, backpressure, A/V skew, process usage, SRT transport) plus [alert rules](monitoring/prometheus/alerts.yml) for the conditions worth paging on: worker down, stuck in passthrough, output dark, >5% deadline misses, stale AI frames, A/V skew over 100 ms.
+
 ## Troubleshooting
 
 **No output at all, or garbled/duplicated frames.** Look for leftover daemons first — this is by far the most common cause. Old instances share the same socket paths, shared-memory name, and output URL, and they will happily fight over all three:
@@ -535,6 +565,7 @@ Ports and adapters, so the availability logic can be tested without GStreamer or
 | [crates/braidpipe/](crates/braidpipe/) | The daemon: CLI, wiring, worker supervision, [preset.rs](crates/braidpipe/src/preset.rs) — the latency/bandwidth profiles — and [relay.rs](crates/braidpipe/src/relay.rs) — the appsink → shm → Python → appsrc data path. |
 | [python/braidpipe/](python/braidpipe/) | `shm.py` (the Rust layout mirror), `stamp.py` (the latency barcode), and four example workers: text overlay, edge transform, YOLO detection, and clock stamping. |
 | [scripts/](scripts/) | Manual end-to-end checks, the latency harness, and the per-preset bandwidth measurement. |
+| [monitoring/](monitoring/) | Prometheus + Grafana compose stack: scrape config, alert rules, provisioned dashboard. |
 | [assets/](assets/) | Logo files: transparent wordmark and icon PNGs, plus a multi-size `.ico`. |
 
 ## Development
