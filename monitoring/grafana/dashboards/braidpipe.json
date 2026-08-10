@@ -1,0 +1,164 @@
+{
+  "title": "braidpipe",
+  "uid": "braidpipe",
+  "timezone": "browser",
+  "refresh": "1s",
+  "time": { "from": "now-15m", "to": "now" },
+  "schemaVersion": 39,
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "AI availability",
+      "gridPos": { "h": 4, "w": 5, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percent", "decimals": 1, "thresholds": { "mode": "absolute", "steps": [
+        { "color": "red", "value": null }, { "color": "yellow", "value": 90 }, { "color": "green", "value": 99 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "refId": "A", "expr": "100 * sum(braidpipe_branch_seconds_total{branch=\"ai\"}) / sum(braidpipe_branch_seconds_total)" } ]
+    },
+    {
+      "id": 2, "type": "stat", "title": "Since last AI frame",
+      "gridPos": { "h": 4, "w": 5, "x": 5, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s", "decimals": 1, "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 5 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "refId": "A", "expr": "time() - braidpipe_last_ai_frame_timestamp_seconds > 0 or vector(0)" } ]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Worker",
+      "gridPos": { "h": 4, "w": 4, "x": 10, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "mappings": [ { "type": "value", "options": {
+        "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } } ], "thresholds": { "mode": "absolute", "steps": [ { "color": "text", "value": null } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [ { "refId": "A", "expr": "braidpipe_worker_up" } ]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Failure streak",
+      "gridPos": { "h": 4, "w": 4, "x": 14, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 30 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "refId": "A", "expr": "braidpipe_failure_streak" } ]
+    },
+    {
+      "id": 5, "type": "stat", "title": "Output fps",
+      "gridPos": { "h": 4, "w": 5, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "fps", "decimals": 1, "thresholds": { "mode": "absolute", "steps": [
+        { "color": "red", "value": null }, { "color": "yellow", "value": 20 }, { "color": "green", "value": 28 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "refId": "A", "expr": "rate(braidpipe_output_frames_total[5s])" } ]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Output bandwidth",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "bps", "custom": { "fillOpacity": 12 } }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "rate(braidpipe_sink_bytes_total[5s]) * 8", "legendFormat": "on wire" } ]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Frame rates",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "fps" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "rate(braidpipe_input_frames_total[5s])", "legendFormat": "input" },
+        { "refId": "B", "expr": "rate(braidpipe_output_frames_total[5s])", "legendFormat": "output" },
+        { "refId": "C", "expr": "rate(braidpipe_frames_total{outcome=\"ai\"}[5s])", "legendFormat": "ai processed" },
+        { "refId": "D", "expr": "rate(braidpipe_frames_total{outcome=\"passthrough\"}[5s])", "legendFormat": "deadline missed" }
+      ]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "AI roundtrip latency vs deadline",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 11 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [
+        { "matcher": { "id": "byName", "options": "deadline" }, "properties": [
+          { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+          { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] } ] },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.5, rate(braidpipe_roundtrip_seconds_bucket[15s]))", "legendFormat": "roundtrip p50" },
+        { "refId": "B", "expr": "histogram_quantile(0.99, rate(braidpipe_roundtrip_seconds_bucket[15s]))", "legendFormat": "roundtrip p99" },
+        { "refId": "C", "expr": "histogram_quantile(0.99, rate(braidpipe_worker_processing_seconds_bucket[15s]))", "legendFormat": "worker compute p99" },
+        { "refId": "D", "expr": "braidpipe_relay_deadline_seconds", "legendFormat": "deadline" }
+      ]
+    },
+    {
+      "id": 13, "type": "state-timeline", "title": "Active branch",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 11 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "mappings": [ { "type": "value", "options": {
+        "0": { "text": "passthrough", "color": "orange" }, "1": { "text": "AI", "color": "green" } } } ],
+        "custom": { "fillOpacity": 70 } }, "overrides": [] },
+      "options": { "legend": { "showLegend": false } },
+      "targets": [ { "refId": "A", "expr": "braidpipe_active_branch", "legendFormat": "branch" } ]
+    },
+    {
+      "id": 14, "type": "timeseries", "title": "Drops and stream problems (per second)",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 18 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "min": 0 }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "rate(braidpipe_relay_channel_drops_total[15s])", "legendFormat": "relay busy drops" },
+        { "refId": "B", "expr": "sum(rate(braidpipe_queue_drop_events_total[15s]))", "legendFormat": "queue drops" },
+        { "refId": "C", "expr": "rate(braidpipe_shm_full_total[15s])", "legendFormat": "shm full" },
+        { "refId": "D", "expr": "rate(braidpipe_stale_acks_total[15s])", "legendFormat": "stale acks" },
+        { "refId": "E", "expr": "rate(braidpipe_pts_discontinuities_total[15s])", "legendFormat": "pts discontinuities" },
+        { "refId": "F", "expr": "rate(braidpipe_bus_messages_total{severity=\"error\"}[15s])", "legendFormat": "bus errors" }
+      ]
+    },
+    {
+      "id": 15, "type": "timeseries", "title": "Backpressure (queue depth, SHM slots)",
+      "gridPos": { "h": 7, "w": 6, "x": 12, "y": 18 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "min": 0, "decimals": 0 }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "braidpipe_queue_depth", "legendFormat": "{{queue}}" },
+        { "refId": "B", "expr": "braidpipe_shm_slots_occupied", "legendFormat": "shm occupied" }
+      ]
+    },
+    {
+      "id": 16, "type": "timeseries", "title": "A/V skew at muxer",
+      "gridPos": { "h": 7, "w": 6, "x": 18, "y": 18 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "thresholdsStyle": { "mode": "line" } },
+        "thresholds": { "mode": "absolute", "steps": [
+          { "color": "green", "value": null }, { "color": "red", "value": 0.1 } ] } }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "braidpipe_av_skew_seconds", "legendFormat": "video - audio" } ]
+    },
+    {
+      "id": 17, "type": "timeseries", "title": "Process memory",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 25 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "process_resident_memory_bytes{job=\"braidpipe\"}", "legendFormat": "daemon" },
+        { "refId": "B", "expr": "braidpipe_worker_resident_memory_bytes", "legendFormat": "worker" }
+      ]
+    },
+    {
+      "id": 18, "type": "timeseries", "title": "Process CPU",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 25 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "rate(process_cpu_seconds_total{job=\"braidpipe\"}[30s])", "legendFormat": "daemon" },
+        { "refId": "B", "expr": "rate(braidpipe_worker_cpu_seconds_total[30s])", "legendFormat": "worker" }
+      ]
+    },
+    {
+      "id": 19, "type": "timeseries", "title": "SRT transport",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 25 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": {}, "overrides": [
+        { "matcher": { "id": "byRegexp", "options": "rtt.*" }, "properties": [ { "id": "unit", "value": "ms" } ] } ] },
+      "targets": [
+        { "refId": "A", "expr": "braidpipe_srt_rtt_ms", "legendFormat": "rtt {{element}}" },
+        { "refId": "B", "expr": "rate(braidpipe_srt_packets_received_lost[30s])", "legendFormat": "loss/s {{element}}" },
+        { "refId": "C", "expr": "rate(braidpipe_srt_packets_received_retransmitted[30s])", "legendFormat": "retrans/s {{element}}" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,56 @@
+# What makes the dashboard operational: the conditions somebody should be
+# paged for, not just able to see. Thresholds assume a live 30fps stream.
+groups:
+  - name: braidpipe
+    rules:
+      - alert: BraidpipeWorkerDown
+        expr: braidpipe_worker_up == 0
+        for: 10s
+        labels:
+          severity: critical
+        annotations:
+          summary: Python worker process is not running
+
+      - alert: BraidpipeInPassthrough
+        expr: braidpipe_active_branch == 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: Stream has been on the passthrough branch for 30s (AI output missing)
+
+      - alert: BraidpipeNoOutput
+        expr: rate(braidpipe_output_frames_total[10s]) == 0
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: No frames are leaving the selector -- the output is dark
+
+      - alert: BraidpipeDeadlineMisses
+        expr: >
+          sum(rate(braidpipe_frames_total{outcome="passthrough"}[1m]))
+            / sum(rate(braidpipe_frames_total[1m])) > 0.05
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Over 5% of frames are missing the AI deadline
+
+      - alert: BraidpipeAiFramesStale
+        expr: >
+          braidpipe_last_ai_frame_timestamp_seconds > 0
+            and time() - braidpipe_last_ai_frame_timestamp_seconds > 5
+        for: 10s
+        labels:
+          severity: warning
+        annotations:
+          summary: No successful AI frame for 5s while the worker is nominally up
+
+      - alert: BraidpipeAvSkew
+        expr: abs(braidpipe_av_skew_seconds) > 0.1
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: Audio/video skew at the muxer exceeds 100ms

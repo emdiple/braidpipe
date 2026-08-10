@@ -1,0 +1,13 @@
+# Scrapes braidpipe's /metrics once a second: this is a single local daemon,
+# so the usual 15s interval would just blur the dashboard.
+global:
+  scrape_interval: 1s
+  evaluation_interval: 1s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: braidpipe
+    static_configs:
+      - targets: ["host.docker.internal:9184"]
