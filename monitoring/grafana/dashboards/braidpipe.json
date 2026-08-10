@@ -7,35 +7,45 @@
   "schemaVersion": 39,
   "panels": [
     {
-      "id": 1, "type": "stat", "title": "AI availability",
-      "gridPos": { "h": 4, "w": 5, "x": 0, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": { "defaults": { "unit": "percent", "decimals": 1, "thresholds": { "mode": "absolute", "steps": [
-        { "color": "red", "value": null }, { "color": "yellow", "value": 90 }, { "color": "green", "value": 99 } ] } }, "overrides": [] },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [ { "refId": "A", "expr": "100 * sum(braidpipe_branch_seconds_total{branch=\"ai\"}) / sum(braidpipe_branch_seconds_total)" } ]
-    },
-    {
-      "id": 2, "type": "stat", "title": "Since last AI frame",
-      "gridPos": { "h": 4, "w": 5, "x": 5, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": { "defaults": { "unit": "s", "decimals": 1, "thresholds": { "mode": "absolute", "steps": [
-        { "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 5 } ] } }, "overrides": [] },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [ { "refId": "A", "expr": "time() - braidpipe_last_ai_frame_timestamp_seconds > 0 or vector(0)" } ]
-    },
-    {
-      "id": 3, "type": "stat", "title": "Worker",
-      "gridPos": { "h": 4, "w": 4, "x": 10, "y": 0 },
+      "id": 0, "type": "stat", "title": "Daemon",
+      "description": "Scrape health. DOWN means the braidpipe process is gone, so every other panel is showing its last known value.",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": { "defaults": { "mappings": [ { "type": "value", "options": {
         "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } } ], "thresholds": { "mode": "absolute", "steps": [ { "color": "text", "value": null } ] } }, "overrides": [] },
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
-      "targets": [ { "refId": "A", "expr": "braidpipe_worker_up" } ]
+      "targets": [ { "refId": "A", "expr": "min(up{job=\"braidpipe\"})" } ]
+    },
+    {
+      "id": 1, "type": "stat", "title": "AI availability",
+      "gridPos": { "h": 4, "w": 5, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percent", "decimals": 1, "noValue": "—", "thresholds": { "mode": "absolute", "steps": [
+        { "color": "red", "value": null }, { "color": "yellow", "value": 90 }, { "color": "green", "value": 99 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "refId": "A", "expr": "(100 * sum(braidpipe_branch_seconds_total{branch=\"ai\"}) / sum(braidpipe_branch_seconds_total)) and on() (min(up{job=\"braidpipe\"}) == 1)" } ]
+    },
+    {
+      "id": 2, "type": "stat", "title": "Since last AI frame",
+      "gridPos": { "h": 4, "w": 5, "x": 13, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s", "decimals": 1, "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 5 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "refId": "A", "expr": "(time() - braidpipe_last_ai_frame_timestamp_seconds > 0 or vector(0)) and on() (min(up{job=\"braidpipe\"}) == 1)" } ]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Worker",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "mappings": [ { "type": "value", "options": {
+        "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } } ], "thresholds": { "mode": "absolute", "steps": [ { "color": "text", "value": null } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [ { "refId": "A", "expr": "(min(braidpipe_worker_up) and on() (min(up{job=\"braidpipe\"}) == 1)) or vector(0)" } ]
     },
     {
       "id": 4, "type": "stat", "title": "Failure streak",
-      "gridPos": { "h": 4, "w": 4, "x": 14, "y": 0 },
+      "gridPos": { "h": 4, "w": 3, "x": 18, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [
         { "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 30 } ] } }, "overrides": [] },
@@ -44,12 +54,12 @@
     },
     {
       "id": 5, "type": "stat", "title": "Output fps",
-      "gridPos": { "h": 4, "w": 5, "x": 18, "y": 0 },
+      "gridPos": { "h": 4, "w": 3, "x": 21, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": { "defaults": { "unit": "fps", "decimals": 1, "thresholds": { "mode": "absolute", "steps": [
         { "color": "red", "value": null }, { "color": "yellow", "value": 20 }, { "color": "green", "value": 28 } ] } }, "overrides": [] },
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [ { "refId": "A", "expr": "rate(braidpipe_output_frames_total[5s])" } ]
+      "targets": [ { "refId": "A", "expr": "rate(braidpipe_output_frames_total[5s]) and on() (min(up{job=\"braidpipe\"}) == 1)" } ]
     },
     {
       "id": 10, "type": "timeseries", "title": "Output bandwidth",

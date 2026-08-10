@@ -3,6 +3,25 @@
 groups:
   - name: braidpipe
     rules:
+      # Every other rule below reads a braidpipe_* series, which stops existing
+      # the moment the daemon does -- so a dead daemon silences them all. This
+      # one watches the scrape itself and is the alert that survives that.
+      - alert: BraidpipeDown
+        expr: up{job="braidpipe"} == 0
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: The braidpipe daemon is not answering scrapes (process gone or endpoint unbound)
+
+      - alert: BraidpipeShuttingDown
+        expr: braidpipe_up == 0
+        for: 0s
+        labels:
+          severity: info
+        annotations:
+          summary: The daemon is draining after a shutdown signal
+
       - alert: BraidpipeWorkerDown
         expr: braidpipe_worker_up == 0
         for: 10s
