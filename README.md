@@ -418,6 +418,22 @@ Any language that can receive a file descriptor over a Unix datagram socket (`re
 
 Everything else is identical to managed mode. The daemon still creates the shared memory segment and binds its socket; the external process implements the same [IPC contract](#the-ipc-contract) that `worker.py` does (all the bundled workers run unchanged either way). Startup order doesn't matter: until a worker acks, the stream runs on passthrough, and the first good frame selects the AI branch — the same machinery that handles failover recovery. If the external process dies, the stream falls back to passthrough and picks up its replacement whenever one appears.
 
+A full example — a live SRT relay with audio, joined later by the YOLO worker started by hand:
+
+```bash
+# terminal 1 — pulls SRT from :8890, serves clean passthrough on :8891 immediately
+cargo run -p braidpipe --release -- \
+  --uri "srt://127.0.0.1:8890?mode=caller" \
+  --output "srt://127.0.0.1:8891?mode=listener" \
+  --external-worker \
+  --audio
+
+# terminal 2 — whenever ready; the output switches to annotated frames on its first ack
+.venv/bin/python3 python/braidpipe/worker_detect.py
+```
+
+In this mode nothing picks the interpreter for you — managed mode's automatic `.venv/bin/python3` preference belongs to the spawn path, so point at the environment that has the worker's dependencies yourself. The bundled workers (except the minimal `worker.py`) read `BRAIDPIPE_RUST_SOCK` / `BRAIDPIPE_PYTHON_SOCK` if the daemon's socket paths were overridden. Stopping the worker drops the stream back to passthrough within the failure streak (~1 s at 30 fps); relaunching it re-attaches through the same hello handshake, no daemon restart involved.
+
 One metric changes meaning: the daemon can't know whether a process it doesn't own is alive, so in this mode `braidpipe_worker_up` means "delivered a successful AI frame within the last 2 seconds" rather than "my child process is running", and `worker_exits_total` / `worker_last_exit_code` / CPU / RSS are never populated.
 
 For a containerized worker only the socket directory must cross the container boundary — mount it and the fd handshake does the rest, because a file descriptor passed over a Unix socket works across container namespaces with no `/dev/shm` mount or `--ipc=host` required. On macOS, Docker runs inside a VM, so neither sockets nor memory can cross — external mode there means a host process, not a container.
