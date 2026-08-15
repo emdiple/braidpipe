@@ -41,27 +41,35 @@ The `input-selector` decides, frame by frame, whether the viewer sees the AI bra
 
 ## Table of contents
 
-- [Table of contents](#table-of-contents)
 - [How the failover works](#how-the-failover-works)
-- [Requirements](#requirements)
-- [Install](#install)
-- [Quick start](#quick-start)
-- [Real-world pipelines](#real-world-pipelines)
-- [Output presets](#output-presets)
-- [GPU acceleration](#gpu-acceleration)
-- [Audio passthrough](#audio-passthrough)
-- [Command-line reference](#command-line-reference)
-- [Writing a Python worker](#writing-a-python-worker)
-- [The IPC contract](#the-ipc-contract)
-- [Testing failover](#testing-failover)
-- [Measuring latency](#measuring-latency)
-- [Monitoring](#monitoring)
-- [Troubleshooting](#troubleshooting)
-- [Project layout](#project-layout)
-- [Development](#development)
-- [Known limitations](#known-limitations)
-- [Contributing](#contributing)
-- [License](#license)
+- [Getting started](#getting-started)
+  - [Requirements](#requirements)
+  - [Install](#install)
+  - [Quick start](#quick-start)
+- [Streaming configuration](#streaming-configuration)
+  - [Real-world pipelines](#real-world-pipelines)
+  - [Output presets](#output-presets)
+  - [GPU acceleration](#gpu-acceleration)
+  - [Audio passthrough](#audio-passthrough)
+  - [Command-line reference](#command-line-reference)
+- [AI workers](#ai-workers)
+  - [Writing a Python worker](#writing-a-python-worker)
+  - [Bundled examples](#bundled-examples)
+  - [Writing a worker in another language](#writing-a-worker-in-another-language)
+  - [External worker mode](#external-worker-mode)
+  - [Workers on another machine (tcp-raw)](#workers-on-another-machine-tcp-raw)
+  - [The IPC contract](#the-ipc-contract)
+- [Operations](#operations)
+  - [Testing failover](#testing-failover)
+  - [Measuring latency](#measuring-latency)
+  - [Monitoring](#monitoring)
+  - [Troubleshooting](#troubleshooting)
+- [Project reference](#project-reference)
+  - [Project layout](#project-layout)
+  - [Development](#development)
+  - [Known limitations](#known-limitations)
+  - [Contributing](#contributing)
+  - [License](#license)
 
 ## How the failover works
 
@@ -73,7 +81,11 @@ Availability is enforced at two independent levels, so a single missed frame is 
 
 Both branch queues are `leaky=downstream`, which matters more than it looks: without leaky queues, buffers piling up on the *inactive* selector pad eventually block the `tee` and stall the entire pipeline, including the branch that was working fine.
 
-## Requirements
+## Getting started
+
+Install the toolchain, build the workspace, and see the failover working on screen — nothing here needs a real video source.
+
+### Requirements
 
 | Component | Version | Notes |
 | --- | --- | --- |
@@ -86,7 +98,7 @@ GStreamer plugins depend on what you actually stream: `srt` for SRT, `x264`/`lib
 
 On Python 3.13+, `SharedMemory(track=False)` keeps Python's resource tracker from unlinking the Rust-owned segment when the worker exits. On older versions the bundled worker falls back automatically, but you may see a resource-tracker warning at shutdown and should restart the daemon rather than reusing the segment.
 
-## Install
+### Install
 
 Debian / Ubuntu:
 
@@ -115,7 +127,7 @@ python3 -m venv .venv
 
 The daemon prefers `.venv/bin/python3` when that path exists and otherwise falls back to `python3` on `PATH`, so a virtualenv at the repository root needs no extra configuration.
 
-## Quick start
+### Quick start
 
 Run from the repository root so the default worker path resolves:
 
@@ -131,7 +143,11 @@ To confirm the media path alone, with no Python involved:
 cargo run -p braidpipe --release -- --passthrough-only
 ```
 
-## Real-world pipelines
+## Streaming configuration
+
+Everything between the input URI and the output URL: real sources and sinks, the encoder presets, GPU offload, audio, and the full flag reference.
+
+### Real-world pipelines
 
 **SRT in, RTMP out** — the common broadcast shape:
 
@@ -187,7 +203,7 @@ cargo run -p braidpipe --release -- --width 1920 --height 1080 --fps 60 \
 
 `--uri` and `--source` are mutually exclusive. Use `--uri` when GStreamer can figure out the source on its own (it picks `srtsrc ! decodebin3` for `srt://` and `uridecodebin3` for everything else); use `--source` when you need to spell out elements yourself.
 
-## Output presets
+### Output presets
 
 Writing the sink by hand, as above, gives full control — but most deployments want one of a few well-understood points on the latency/bandwidth curve. `--output` plus `--preset` builds the whole encoder + mux + sink chain for you, the way ffmpeg's `-preset` expands into a bag of x264 options:
 
@@ -230,7 +246,7 @@ BRAIDPIPE_BITRATE_KBPS=2500 cargo run -p braidpipe --release -- \
 
 Verified end-to-end with the [latency harness](#measuring-latency): `--preset lowlatency --output rtmp://…` measured 39.8 ms p50 / 45.6 ms p99 worker→receiver at 720p30, identical to the hand-tuned sink.
 
-### Measured bandwidth
+#### Measured bandwidth
 
 Bitrate targets are promises until you look at the wire, so `scripts/preset-bandwidth.sh` runs each preset through the full daemon + worker path, captures the RTMP output, and reports what actually left the encoder. Content is a moving scene blended with 30% white noise — a stand-in for camera footage, hard enough to push rate control against its cap. 20-second runs at 720p30, startup excluded:
 
@@ -247,7 +263,7 @@ Three things worth reading out of that table:
 - **`zerolatency` runs ~15% under target on hard content.** The 100 ms VBV is tight enough to constrain ABR itself, trading a little quality for the strictest burst bound. That is the correct trade for its use case.
 - **`bandwidth` spends almost nothing on this content, and that is by design, not a bug.** Without `tune=zerolatency`, x264's mbtree lookahead rates every block by how much future frames can predict from it — and noise predicts nothing, so mbtree declines to encode it. The synthetic content is 30% noise; real footage has structure everywhere and will sit far closer to target. Either way the target is a hard ceiling, never a floor: this preset buys quality-per-bit, not constant bandwidth. (On pure noise — `BRAIDPIPE_BW_PATTERN=snow` — the effect is even starker, while the three zerolatency presets still hold their caps, since zerolatency disables mbtree.)
 
-## GPU acceleration
+### GPU acceleration
 
 On a machine with a capable GPU, both halves of the codec work move off the CPU automatically. The mechanism differs per platform because every OS has its own video API:
 
@@ -277,7 +293,7 @@ Two knobs control this, each a CLI flag with an environment-variable twin (the f
 
 A hand-written `--sink` bypasses encoder selection entirely — you name the encoder yourself.
 
-## Audio passthrough
+### Audio passthrough
 
 Real sources carry audio, and the output should too. `--audio` routes the source's audio around the AI branch — decoded, re-encoded to AAC, and joined back at the output muxer:
 
@@ -304,7 +320,7 @@ Measured on a live SRT source (video + audio) relayed to RTMP at 720p30: steady-
 
 If the source has no audio stream, don't pass `--audio` — the audio branch would wait forever for a pad that never appears and GStreamer fails the pipeline with a delayed-linking error.
 
-## Command-line reference
+### Command-line reference
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
@@ -322,6 +338,7 @@ If the source has no audio stream, don't pass `--audio` — the audio branch wou
 | `--width <N>` / `--height <N>` | `1280` / `720` | Shared-memory slot geometry |
 | `--rust-sock <PATH>` | `/tmp/braidpipe_rust.sock` | Where the daemon listens for acks and hellos |
 | `--python-sock <PATH>` | `/tmp/braidpipe_python.sock` | Where the worker listens for notifications |
+| `--worker-listen <IP:PORT>` | — | Also accept workers from other machines (tcp-raw), see [Workers on another machine](#workers-on-another-machine-tcp-raw) |
 | `--passthrough-only` | off | Media path only; no worker, no shared memory |
 | `--metrics-port <N>` | `9184` | Prometheus endpoint on 127.0.0.1, see [Monitoring](#monitoring); `0` disables |
 | `--metrics-drain-ms <N>` | `2000` | How long to keep serving metrics after a shutdown signal, so the down state gets scraped |
@@ -330,7 +347,11 @@ If the source has no audio stream, don't pass `--audio` — the audio branch wou
 
 Set `RUST_LOG=debug` to see per-frame relay activity, including dropped and stale acks.
 
-## Writing a Python worker
+## AI workers
+
+The other side of the shared memory: the contract a worker implements, the bundled examples, and every way to attach one — spawned by the daemon, started by hand, in a container, or on another machine.
+
+### Writing a Python worker
 
 A worker is a loop over one Unix datagram socket. `attach()` runs the handshake — it says hello to the daemon, which answers with the shared-memory segment's file descriptor — and returns a `SharedMemoryManager` giving you a zero-copy NumPy view of each slot, so mutating the array in place *is* writing to the output frame — there's no separate send step for pixels.
 
@@ -418,13 +439,62 @@ Any language that can receive a file descriptor over a Unix datagram socket (`re
 
 Everything else is identical to managed mode. The daemon still creates the shared memory segment and binds its socket; the external process implements the same [IPC contract](#the-ipc-contract) that `worker.py` does (all the bundled workers run unchanged either way). Startup order doesn't matter: until a worker acks, the stream runs on passthrough, and the first good frame selects the AI branch — the same machinery that handles failover recovery. If the external process dies, the stream falls back to passthrough and picks up its replacement whenever one appears.
 
+A full example — a live SRT relay with audio, joined later by the YOLO worker started by hand:
+
+```bash
+# terminal 1 — pulls SRT from :8890, serves clean passthrough on :8891 immediately
+cargo run -p braidpipe --release -- \
+  --uri "srt://127.0.0.1:8890?mode=caller" \
+  --output "srt://127.0.0.1:8891?mode=listener" \
+  --external-worker \
+  --audio
+
+# terminal 2 — whenever ready; the output switches to annotated frames on its first ack
+.venv/bin/python3 python/braidpipe/worker_detect.py
+```
+
+In this mode nothing picks the interpreter for you — managed mode's automatic `.venv/bin/python3` preference belongs to the spawn path, so point at the environment that has the worker's dependencies yourself. The bundled workers (except the minimal `worker.py`) read `BRAIDPIPE_RUST_SOCK` / `BRAIDPIPE_PYTHON_SOCK` if the daemon's socket paths were overridden. Stopping the worker drops the stream back to passthrough within the failure streak (~1 s at 30 fps); relaunching it re-attaches through the same hello handshake, no daemon restart involved.
+
 One metric changes meaning: the daemon can't know whether a process it doesn't own is alive, so in this mode `braidpipe_worker_up` means "delivered a successful AI frame within the last 2 seconds" rather than "my child process is running", and `worker_exits_total` / `worker_last_exit_code` / CPU / RSS are never populated.
 
-For a containerized worker only the socket directory must cross the container boundary — mount it and the fd handshake does the rest, because a file descriptor passed over a Unix socket works across container namespaces with no `/dev/shm` mount or `--ipc=host` required. On macOS, Docker runs inside a VM, so neither sockets nor memory can cross — external mode there means a host process, not a container.
+For a containerized worker only the socket directory must cross the container boundary — mount it and the fd handshake does the rest, because a file descriptor passed over a Unix socket works across container namespaces with no `/dev/shm` mount or `--ipc=host` required. On macOS, Docker runs inside a VM, so neither sockets nor memory can cross — external mode there means a host process, not a container (or a worker using the tcp-raw transport below, which crosses anything TCP crosses).
 
-## The IPC contract
+### Workers on another machine (tcp-raw)
 
-**Shared memory** — one *anonymous* segment (a `memfd` on Linux, an unlinked POSIX object elsewhere) holding a 32-byte header followed by `slot_count` slots. Each slot is a 24-byte header plus `width × height × channels` bytes of pixels. The segment has no name anywhere: a worker gets in by sending `{"type": "hello"}` to the daemon's socket, and the daemon replies with a datagram (body `{"type": "shm_fd"}`) carrying the segment's file descriptor as `SCM_RIGHTS` ancillary data. The kernel duplicates the descriptor into the worker, which `fstat`s it for the size and `mmap`s it. Because nothing is ever named, nothing can collide between instances, go stale after a crash, or need permission juggling — the kernel frees the segment when the last descriptor and mapping are gone. A worker may say hello before the daemon is up (retry until answered) or at any point after; replies are sent whenever frames are flowing.
+`--worker-listen IP:PORT` opens the worker negotiation to the network: UDP on that address answers hellos with a config packet, and TCP on the same port carries raw frames both ways. Same-host shm workers keep working alongside it — the transport is chosen per worker by where its hello arrives.
+
+```bash
+# machine A — the daemon
+cargo run -p braidpipe --release -- --external-worker --worker-listen 0.0.0.0:7300
+
+# machine B — any bundled worker, pointed at the daemon
+BRAIDPIPE_DAEMON=192.168.1.10:7300 python3 worker_edges.py
+```
+
+The worker's hello (`{"type": "hello", "transports": ["tcp-raw"]}`) is answered with `{"type": "config", "transport": "tcp-raw", "data_port": …, "width": …, "height": …, "channels": …, "format": "rgb"}`. The worker then opens one TCP connection to `data_port`, and every frame in either direction is a fixed 24-byte header plus the raw pixels — [python/braidpipe/remote.py](python/braidpipe/remote.py) wraps this in the same attach-and-loop shape the shm side has:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `frame_id` | `u64` LE | Matches the result to the frame |
+| `time_us` | `u64` LE | Capture timestamp toward the worker; processing time on the way back |
+| `payload_len` | `u32` LE | Always `width × height × channels` |
+| `slot` | `u8` | Echo back unchanged; names the daemon-side slot |
+| `flags` | `u8` + 2 pad | Bit 0 = success, on results |
+
+Sending the result back **is** the ack — there are no separate datagrams. On the daemon side the result lands in the same shm slot a local worker would have written, so the relay, the deadline, and the watchdog treat both transports identically, and failover behaves exactly as in [External worker mode](#external-worker-mode): worker dies → passthrough within the failure streak, reconnect → AI branch on the first good frame. Backpressure is drop, not buffer: a frame that cannot be sent within one deadline tears the connection down rather than queueing stale video.
+
+The frames are uncompressed, which makes bandwidth the deciding constraint — frames cross the wire twice (out and back):
+
+| Geometry | Round trip @ 30 fps | Verdict |
+| --- | --- | --- |
+| 1280×720×3 (default) | ~1.3 Gbit/s | 2.5 GbE or better; a quiet gigabit link will drop frames |
+| 1920×1080×3 | ~3.0 Gbit/s | 10 GbE territory |
+
+Wire time also eats into the 1.5-frame deadline (a 720p frame takes ~24 ms each way on gigabit, ~2 ms on 10 GbE), so this transport wants a fast LAN. For constrained networks, run the worker's machine as an SRT hop with its own braidpipe instead — or wait for a compressed transport. Since tcp-raw is ordinary TCP/UDP, it also crosses boundaries the fd handshake cannot: a Docker container on macOS (publish the port with `-p 7300:7300 -p 7300:7300/udp`) or any VM.
+
+### The IPC contract
+
+**Shared memory** — one *anonymous* segment (a `memfd` on Linux, an unlinked POSIX object elsewhere) holding a 32-byte header followed by `slot_count` slots. Each slot is a 24-byte header plus `width × height × channels` bytes of pixels. The segment has no name anywhere: a worker gets in by sending `{"type": "hello"}` to the daemon's socket (optionally with a `"transports"` list; over UDS the answer is always shm), and the daemon replies with a config datagram (body `{"type": "config", "transport": "shm", …}` describing the ring geometry) carrying the segment's file descriptor as `SCM_RIGHTS` ancillary data. The kernel duplicates the descriptor into the worker, which `fstat`s it for the size and `mmap`s it. Because nothing is ever named, nothing can collide between instances, go stale after a crash, or need permission juggling — the kernel frees the segment when the last descriptor and mapping are gone. A worker may say hello before the daemon is up (retry until answered) or at any point after; replies are sent whenever frames are flowing.
 
 All layouts are explicitly padded on the Rust side and mirrored by `struct` format strings in [python/braidpipe/shm.py](python/braidpipe/shm.py), which assert their own sizes at import — a mismatch fails loudly instead of silently reading garbage.
 
@@ -449,7 +519,11 @@ Python → Rust acknowledges it:
 
 Datagrams are used deliberately: they're unordered and droppable, which matches a real-time pipeline where a late frame has no value. The relay discards acks whose `frame_id` doesn't match the frame it's currently waiting on.
 
-## Testing failover
+## Operations
+
+Proving the availability claim and keeping an eye on it: failover drills, latency numbers, the metrics stack, and the usual failure modes.
+
+### Testing failover
 
 The interesting property is what happens when Python dies mid-stream. Start the daemon, wait for `branch=AiProcess`, then kill the worker using the PID from the log line `Python worker active pid=…`:
 
@@ -486,7 +560,7 @@ There's also a manual SRT check that exercises URI ingestion end to end with a g
 bash scripts/e2e-srt-autovideosink.sh
 ```
 
-## Measuring latency
+### Measuring latency
 
 ```bash
 bash scripts/rtmp-latency.sh
@@ -545,7 +619,7 @@ arrival interval  min= 16.30  p50= 33.33  p90= 35.49  p99= 37.87  max= 38.18  (m
 
 Every stamped frame is gone — the AI branch never made its deadline once — and the output still arrives at a 33.33 ms median, which is 30 fps exactly. Nothing downstream could tell the worker had failed.
 
-## Monitoring
+### Monitoring
 
 The daemon serves Prometheus metrics on `http://127.0.0.1:9184/metrics` (change with `--metrics-port`, `0` disables). Most of the numbers were already being measured for the failover logic — the endpoint makes them visible: every ack carries the worker's processing time, the relay times every roundtrip, the bridge counts the failure streak. The instrumentation adds nothing to the frame path beyond lock-free counter increments.
 
@@ -574,7 +648,7 @@ cd monitoring && docker compose up -d
 
 It scrapes once a second and ships a provisioned dashboard (bandwidth, frame rates, latency percentiles against the deadline, branch state timeline, drops, backpressure, A/V skew, process usage, SRT transport) plus [alert rules](monitoring/prometheus/alerts.yml) for the conditions worth paging on: daemon unreachable, worker down, stuck in passthrough, output dark, >5% deadline misses, stale AI frames, A/V skew over 100 ms.
 
-### Shutdown and stale panels
+#### Shutdown and stale panels
 
 A metric that stops being scraped keeps its last value on screen, so a daemon that dies looks identical to one that is healthy and idle. Three things prevent that misreading:
 
@@ -582,7 +656,7 @@ A metric that stops being scraped keeps its last value on screen, so a daemon th
 - **The dashboard gates on the scrape**, not on the daemon's own metrics. The Daemon panel reads `up{job="braidpipe"}` — Prometheus writes that even when the target is gone — and the availability, worker, and fps panels are conditioned on it, so they blank or read DOWN rather than freezing on the last healthy sample. `BraidpipeDown` alerts on the same series, and is the only rule that can fire when the daemon no longer exists to report anything.
 - **Shutdown cannot hang.** Ctrl+C reaches the worker only when both share a terminal, so the daemon SIGTERMs it explicitly (SIGKILL after 2 s). Pipeline teardown is bounded by a guard that force-exits `--metrics-drain-ms` + 4 s after the signal: on macOS, `set_state(NULL)` on the GL video sink deadlocks against its own GL thread, and a daemon wedged there is the worst case of all — still alive, still serving, still reporting the last healthy sample.
 
-## Troubleshooting
+### Troubleshooting
 
 **No output at all, or garbled/duplicated frames.** Look for leftover daemons first — this is by far the most common cause. Old instances share the same socket paths and output URL, and they will happily fight over both:
 
@@ -611,7 +685,11 @@ Raising `GST_DEBUG` to find it is reasonable, but redirect to a file you are wil
 
 **Overlay colours look wrong.** Frames are RGB; OpenCV colour tuples are BGR. Swap the outer channels.
 
-## Project layout
+## Project reference
+
+Where things live in the repository, how to work on it, and what is deliberately not built yet.
+
+### Project layout
 
 Ports and adapters, so the availability logic can be tested without GStreamer or Python in the loop:
 
@@ -626,7 +704,7 @@ Ports and adapters, so the availability logic can be tested without GStreamer or
 | [monitoring/](monitoring/) | Prometheus + Grafana compose stack: scrape config, alert rules, provisioned dashboard. |
 | [assets/](assets/) | Logo files: transparent wordmark and icon PNGs, plus a multi-size `.ico`. |
 
-## Development
+### Development
 
 ```bash
 cargo test --workspace
@@ -636,7 +714,7 @@ cargo fmt --all
 
 `relay.rs` is the place to start reading if you want to understand or change frame handling: it's short, and every failure path in it exists to protect the never-dark guarantee.
 
-## Known limitations
+### Known limitations
 
 - **No worker respawn.** If the Python process dies, the daemon logs it and stays in passthrough for the rest of the run. Restart the worker manually or supervise it externally.
 - **Single video stream.** One source, one sink, one worker per daemon. Run multiple daemons with distinct socket paths for multiple streams — the shared memory is anonymous, so only the sockets need distinct names.
@@ -646,13 +724,13 @@ cargo fmt --all
 - **Video only.** Audio is not carried through the pipeline.
 - **No Python SDK.** `shm.py` mirrors the shared-memory layout and nothing more: it is not packaged, not on PyPI, and has no importable name. Every worker re-implements the same socket loop, slot release, and ack handling by copying an example. A thin `braidpipe` package wrapping that loop would remove the copy-paste, and is the obvious next piece of work.
 
-## Contributing
+### Contributing
 
 Issues and pull requests are welcome. Please run `cargo test --workspace`, `cargo clippy --workspace --all-targets`, and `cargo fmt --all` before opening a PR, and describe what you tested — for media changes, say which source and sink you actually ran, since plugin availability varies a lot between machines.
 
 Commit messages follow Conventional Commits with a single-line subject, for example `fix(ipc): align shm layout with python`.
 
-## License
+### License
 
 Apache-2.0. See [LICENSE](LICENSE).
 
