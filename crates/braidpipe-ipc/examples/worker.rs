@@ -1,23 +1,21 @@
 //! A worker written in Rust — a drop-in replacement for a Python worker.
 //!
 //! Nothing about the contract is Python-specific: a worker is any process that
-//! attaches to the daemon's shared-memory segment, listens on a Unix datagram
-//! socket, mutates pixels in place, frees the slot, and acks. This example does
-//! exactly that in about a hundred lines, reusing the daemon's own layout types
-//! so it cannot drift out of sync with them.
+//! binds a Unix datagram socket, says hello to the daemon, receives the shared
+//! memory segment's file descriptor as SCM_RIGHTS ancillary data, mutates
+//! pixels in place, frees the slot, and acks. This example does exactly that
+//! in about a hundred lines, reusing the daemon's own layout types so it
+//! cannot drift out of sync with them.
 //!
-//! Unlike the daemon, a worker only ever *attaches* to shared memory. It must
-//! never call `ShmRingBuffer::create`, which unlinks and reinitialises the
-//! segment — that would pull the floor out from under the running daemon.
+//! The segment is anonymous — it has no name in any filesystem or SHM
+//! namespace. The fd handed over during the hello handshake is the only way
+//! in, which is also why a stale segment can never survive a crashed daemon.
 //!
 //! # Running it
 //!
-//! The daemon always spawns its `--python-script`, so point that at a no-op and
-//! run this worker yourself:
-//!
 //! ```sh
-//! # terminal 1 — creates the SHM segment, streams, and stays in passthrough
-//! cargo run -p braidpipe --release -- --python-script /dev/null
+//! # terminal 1 — creates the segment, streams, and stays in passthrough
+//! cargo run -p braidpipe --release -- --external-worker
 //!
 //! # terminal 2 — the AI branch is selected on this worker's first good frame
 //! cargo run -p braidpipe-ipc --release --example worker
@@ -27,14 +25,13 @@
 //! as it does for a Python worker.
 
 use braidpipe_ipc::shm::{SLOT_FREE, ShmHeader, SlotHeader};
-use braidpipe_ipc::uds::{FrameProcessedPacket, FrameReadyPacket};
-use std::ffi::CString;
+use braidpipe_ipc::uds::{FrameProcessedPacket, FrameReadyPacket, WORKER_HELLO};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixDatagram;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{env, fs, io, ptr, slice};
 
-const DEFAULT_SHM_NAME: &str = "/braidpipe_buffer";
 const DEFAULT_RUST_SOCK: &str = "/tmp/braidpipe_rust.sock";
 const DEFAULT_PYTHON_SOCK: &str = "/tmp/braidpipe_python.sock";
 
@@ -50,16 +47,10 @@ struct AttachedShm {
 }
 
 impl AttachedShm {
-    fn attach(shm_name: &str) -> io::Result<Self> {
-        let c_name = CString::new(shm_name).expect("shm name has no interior nul");
-
+    /// Maps the fd received from the daemon's hello reply. The daemon owns
+    /// the geometry; everything is read from the fd and the header.
+    fn attach(fd: RawFd) -> io::Result<Self> {
         unsafe {
-            let fd = libc::shm_open(c_name.as_ptr(), libc::O_RDWR, 0o666);
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-
-            // The daemon owns the size; read it rather than assuming it.
             let mut stat: libc::stat = std::mem::zeroed();
             if libc::fstat(fd, &mut stat) != 0 {
                 let err = io::Error::last_os_error();
@@ -125,9 +116,78 @@ impl AttachedShm {
 
 impl Drop for AttachedShm {
     fn drop(&mut self) {
-        // Unmap only. Unlinking is the daemon's job — it owns the segment.
+        // Unmap only; the daemon's fd keeps the segment alive.
         unsafe { libc::munmap(self.base as *mut libc::c_void, self.len) };
     }
+}
+
+/// Receives one datagram, extracting an SCM_RIGHTS fd if one rode along.
+fn recv_with_fd(socket: &UnixDatagram, buf: &mut [u8]) -> io::Result<(usize, Option<RawFd>)> {
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    let mut cmsg_buf = [0u64; 8];
+
+    unsafe {
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = libc::CMSG_SPACE(size_of::<RawFd>() as u32) as _;
+
+        let bytes = libc::recvmsg(socket.as_raw_fd(), &mut msg, 0);
+        if bytes < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if !cmsg.is_null()
+            && (*cmsg).cmsg_level == libc::SOL_SOCKET
+            && (*cmsg).cmsg_type == libc::SCM_RIGHTS
+        {
+            let mut fd: RawFd = -1;
+            ptr::copy_nonoverlapping(
+                libc::CMSG_DATA(cmsg),
+                &mut fd as *mut RawFd as *mut u8,
+                size_of::<RawFd>(),
+            );
+            return Ok((bytes as usize, Some(fd)));
+        }
+        Ok((bytes as usize, None))
+    }
+}
+
+/// Says hello to the daemon until it answers with the segment fd. Retries
+/// forever, so this worker may start before the daemon does.
+fn handshake(socket: &UnixDatagram, rust_sock: &str) -> io::Result<RawFd> {
+    socket.set_read_timeout(Some(Duration::from_secs(1)))?;
+    let mut buf = [0u8; 512];
+    let mut waiting_since: Option<Instant> = None;
+
+    let fd = loop {
+        if socket.send_to(WORKER_HELLO, rust_sock).is_err() {
+            if waiting_since.is_none() {
+                println!("[rust-worker] daemon not up yet at {rust_sock}; waiting...");
+                waiting_since = Some(Instant::now());
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+        match recv_with_fd(socket, &mut buf) {
+            Ok((_, Some(fd))) => break fd,
+            // A frame notification that raced the handshake, or a timeout:
+            // either way, ask again.
+            Ok((_, None)) => continue,
+            Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                continue
+            }
+            Err(error) => return Err(error),
+        }
+    };
+
+    socket.set_read_timeout(None)?;
+    Ok(fd)
 }
 
 /// The processing step: greyscale the left half, and draw a progress bar whose
@@ -160,23 +220,19 @@ fn process(pixels: &mut [u8], width: usize, height: usize, channels: usize, fram
 }
 
 fn main() -> io::Result<()> {
-    let shm_name = env::var("BRAIDPIPE_SHM_NAME").unwrap_or_else(|_| DEFAULT_SHM_NAME.into());
     let rust_sock = env::var("BRAIDPIPE_RUST_SOCK").unwrap_or_else(|_| DEFAULT_RUST_SOCK.into());
     let python_sock =
         env::var("BRAIDPIPE_PYTHON_SOCK").unwrap_or_else(|_| DEFAULT_PYTHON_SOCK.into());
-
-    let mut shm = AttachedShm::attach(&shm_name).map_err(|e| {
-        io::Error::other(format!(
-            "cannot attach to shared memory {shm_name}: {e} — is the daemon running?"
-        ))
-    })?;
 
     // A stale socket file survives a SIGKILL; clear it before binding.
     let _ = fs::remove_file(&python_sock);
     let socket = UnixDatagram::bind(&python_sock)?;
 
+    let fd = handshake(&socket, &rust_sock)?;
+    let mut shm = AttachedShm::attach(fd)?;
+
     println!(
-        "[rust-worker] attached to {shm_name} ({}x{} @ {}ch, {} slots), listening on {python_sock}",
+        "[rust-worker] attached to shared memory ({}x{} @ {}ch, {} slots), listening on {python_sock}",
         shm.width, shm.height, shm.channels, shm.slot_count
     );
 
@@ -190,6 +246,9 @@ fn main() -> io::Result<()> {
         let bytes = socket.recv(&mut buf)?;
         let notice: FrameReadyPacket = match serde_json::from_slice(&buf[..bytes]) {
             Ok(packet) => packet,
+            // Control packets (a duplicate handshake reply) are not malformed,
+            // just not for this loop.
+            Err(_) if buf[..bytes].windows(6).any(|w| w == b"\"type\"") => continue,
             Err(error) => {
                 eprintln!("[rust-worker] malformed notification: {error}");
                 continue;

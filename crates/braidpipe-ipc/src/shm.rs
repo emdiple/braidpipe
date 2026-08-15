@@ -1,5 +1,4 @@
 use braidpipe_core::ports::ai::{FrameMetadata, IpcError, ShmWriter};
-use std::ffi::CString;
 use std::ptr;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use tracing::{debug, info};
@@ -9,7 +8,7 @@ pub const SLOT_FREE: u8 = 0;
 pub const SLOT_READY_FOR_AI: u8 = 1;
 pub const SLOT_PROCESSING: u8 = 2;
 
-/// Memory-mapped header at offset 0 of /dev/shm.
+/// Memory-mapped header at offset 0 of the shared segment.
 /// Layout is fully explicit (no implicit repr(C) padding) so the Python side
 /// can mirror it with struct format "<IIBB2xI16s" (32 bytes total).
 #[repr(C)]
@@ -34,11 +33,53 @@ pub struct SlotHeader {
 }
 
 pub struct ShmRingBuffer {
-    shm_name: String,
     fd: i32,
     mmap_ptr: *mut u8,
     total_size: usize,
     header: &'static ShmHeader,
+}
+
+/// An anonymous shared-memory file descriptor: no name in any filesystem or
+/// SHM namespace, so nothing to collide with, leak after a crash, or chmod.
+/// Workers receive a duplicate of this fd over the UDS socket (SCM_RIGHTS);
+/// the kernel frees the segment when the last fd and mapping are gone.
+#[cfg(target_os = "linux")]
+fn create_anonymous_fd() -> Result<i32, IpcError> {
+    let name = std::ffi::CString::new("braidpipe-frames").expect("static name has no nul");
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
+    if fd < 0 {
+        return Err(IpcError::ShmError(format!(
+            "memfd_create failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(fd)
+}
+
+/// POSIX has no memfd_create; the equivalent is a named segment unlinked the
+/// instant it is open. The name exists only inside this function, so the
+/// segment behaves as anonymous everywhere else.
+#[cfg(not(target_os = "linux"))]
+fn create_anonymous_fd() -> Result<i32, IpcError> {
+    let name = std::ffi::CString::new(format!("/braidpipe-{}", std::process::id()))
+        .expect("pid-based name has no nul");
+    unsafe {
+        // A crashed run with a recycled pid could have left this name behind.
+        libc::shm_unlink(name.as_ptr());
+        let fd = libc::shm_open(
+            name.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            0o600,
+        );
+        if fd < 0 {
+            return Err(IpcError::ShmError(format!(
+                "shm_open failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        libc::shm_unlink(name.as_ptr());
+        Ok(fd)
+    }
 }
 
 // Safety: The Shared Memory buffer is thread-safe due to atomic slot state management
@@ -46,33 +87,17 @@ unsafe impl Send for ShmRingBuffer {}
 unsafe impl Sync for ShmRingBuffer {}
 
 impl ShmRingBuffer {
-    pub fn create(
-        shm_name: &str,
-        width: u32,
-        height: u32,
-        channels: u8,
-        slot_count: u8,
-    ) -> Result<Self, IpcError> {
+    pub fn create(width: u32, height: u32, channels: u8, slot_count: u8) -> Result<Self, IpcError> {
         let slot_size = (width * height * channels as u32) as usize;
         let slot_header_size = std::mem::size_of::<SlotHeader>();
         let per_slot_total = slot_header_size + slot_size;
         let header_size = std::mem::size_of::<ShmHeader>();
         let total_size = header_size + (per_slot_total * slot_count as usize);
 
-        let c_name = CString::new(shm_name)
-            .map_err(|e| IpcError::ShmError(format!("Invalid SHM name: {e}")))?;
+        // 1. Create the anonymous shared memory file descriptor
+        let fd = create_anonymous_fd()?;
 
         unsafe {
-            // Remove any stale segment from a crashed run: on macOS ftruncate
-            // fails with EINVAL when a POSIX SHM object already has a size.
-            libc::shm_unlink(c_name.as_ptr());
-
-            // 1. Open POSIX shared memory file descriptor (/dev/shm)
-            let fd = libc::shm_open(c_name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o666);
-            if fd < 0 {
-                return Err(IpcError::ShmError("Failed to execute shm_open".into()));
-            }
-
             // 2. Set memory region size
             if libc::ftruncate(fd, total_size as libc::off_t) != 0 {
                 libc::close(fd);
@@ -81,7 +106,7 @@ impl ShmRingBuffer {
                 ));
             }
 
-            // 3. Memory-map (/dev/shm) into current process virtual memory space
+            // 3. Memory-map the segment into current process virtual memory space
             let mmap_ptr = libc::mmap(
                 ptr::null_mut(),
                 total_size,
@@ -126,16 +151,21 @@ impl ShmRingBuffer {
                 );
             }
 
-            info!(shm_name = %shm_name, bytes = total_size, "Created POSIX Shared Memory Ring Buffer");
+            info!(fd, bytes = total_size, "Created anonymous shared-memory ring buffer");
 
             Ok(Self {
-                shm_name: shm_name.to_string(),
                 fd,
                 mmap_ptr,
                 total_size,
                 header: &*header_ptr,
             })
         }
+    }
+
+    /// The segment's file descriptor, for handing to a worker via SCM_RIGHTS.
+    /// Valid for as long as this ring buffer is alive.
+    pub fn fd(&self) -> i32 {
+        self.fd
     }
 
     /// Reclaims a slot whose notification or ack failed, so a worker that
@@ -217,13 +247,13 @@ impl ShmRingBuffer {
 
 impl Drop for ShmRingBuffer {
     fn drop(&mut self) {
+        // No unlink: the segment has no name. The kernel frees it once every
+        // fd (including copies passed to workers) and mapping is gone.
         unsafe {
             libc::munmap(self.mmap_ptr as *mut libc::c_void, self.total_size);
             libc::close(self.fd);
-            let c_name = CString::new(self.shm_name.as_str()).unwrap();
-            libc::shm_unlink(c_name.as_ptr());
-            info!(shm_name = %self.shm_name, "Unlinked Shared Memory allocation");
         }
+        info!("Released shared-memory ring buffer");
     }
 }
 
@@ -295,5 +325,53 @@ impl ShmWriter for ShmRingBuffer {
 
         // All slots were busy/processing!
         Err(IpcError::BufferFull)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fd must describe the full segment and remain usable as a second,
+    /// independent mapping -- exactly what a worker does after SCM_RIGHTS.
+    #[test]
+    fn anonymous_fd_maps_to_the_same_pages() {
+        let (width, height, channels, slots) = (4u32, 2u32, 3u8, 2u8);
+        let shm = ShmRingBuffer::create(width, height, channels, slots).unwrap();
+
+        let expected = std::mem::size_of::<ShmHeader>()
+            + slots as usize
+                * (std::mem::size_of::<SlotHeader>() + (width * height * u32::from(channels)) as usize);
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(shm.fd(), &mut stat) }, 0);
+        // macOS rounds segments up to the page size; the fd must cover at
+        // least the layout, and workers read offsets from the header anyway.
+        assert!(stat.st_size as usize >= expected);
+
+        let frame = vec![7u8; (width * height * u32::from(channels)) as usize];
+        let meta = shm.write_frame(42, &frame).unwrap();
+
+        unsafe {
+            let base = libc::mmap(
+                std::ptr::null_mut(),
+                expected,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                shm.fd(),
+                0,
+            ) as *const u8;
+            assert_ne!(base, libc::MAP_FAILED as *const u8);
+
+            let header = &*(base as *const ShmHeader);
+            assert_eq!((header.width, header.height), (width, height));
+
+            let payload = base.add(
+                std::mem::size_of::<ShmHeader>()
+                    + meta.slot_index as usize * header.slot_size as usize
+                    + std::mem::size_of::<SlotHeader>(),
+            );
+            assert_eq!(std::slice::from_raw_parts(payload, frame.len()), &frame[..]);
+            libc::munmap(base as *mut libc::c_void, expected);
+        }
     }
 }

@@ -79,10 +79,6 @@ struct Args {
     #[arg(long, default_value_t = 720)]
     height: u32,
 
-    /// POSIX Shared Memory handle name
-    #[arg(long, default_value = "/braidpipe_buffer")]
-    shm_name: String,
-
     /// Socket path for Rust UDS listener
     #[arg(long, default_value = "/tmp/braidpipe_rust.sock")]
     rust_sock: String,
@@ -204,14 +200,13 @@ async fn run() -> Result<(), AppError> {
         return Ok(());
     }
 
-    // 3. Initialize Shared Memory Ring Buffer (/dev/shm)
+    // 3. Initialize the anonymous shared-memory ring buffer. It has no name
+    // anywhere; workers receive its fd over the UDS socket when they say hello.
     info!(
-        name = %args.shm_name,
         resolution = %format!("{}x{}", args.width, args.height),
-        "Allocating POSIX Shared Memory ring buffer..."
+        "Allocating anonymous shared-memory ring buffer..."
     );
     let shm_buffer = Arc::new(ShmRingBuffer::create(
-        &args.shm_name,
         args.width,
         args.height,
         3, // RGB 3-channel
@@ -220,7 +215,10 @@ async fn run() -> Result<(), AppError> {
 
     // 4. Bind the Unix Domain Socket Signaling Adapter
     info!("Binding UDS control channels...");
-    let ai_bridge = Arc::new(UdsControlBridge::bind(&args.rust_sock, &args.python_sock).await?);
+    let ai_bridge = Arc::new(
+        UdsControlBridge::bind(&args.rust_sock, &args.python_sock, Arc::clone(&shm_buffer))
+            .await?,
+    );
 
     // 5. Attach the frame relay: appsink -> SHM -> Python -> appsrc
     relay::spawn(
