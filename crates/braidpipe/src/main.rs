@@ -42,6 +42,16 @@ struct Args {
     #[arg(long, default_value = "lowlatency", requires = "output")]
     preset: String,
 
+    /// GPU mode: "auto" uses hardware decoders/encoders when the machine has
+    /// them, "off" forces software both ways. Overrides BRAIDPIPE_HW
+    #[arg(long, value_parser = ["auto", "off"])]
+    hw: Option<String>,
+
+    /// Video encoder used with --output: "auto" picks the best hardware
+    /// encoder (else x264), or pin one explicitly. Overrides BRAIDPIPE_ENCODER
+    #[arg(long, requires = "output", value_parser = preset::ENCODER_VALUES)]
+    encoder: Option<String>,
+
     /// Carry the source's audio through to the output. Audio bypasses the AI
     /// branch and is re-joined at the muxer; sync is preserved by timestamps
     #[arg(long)]
@@ -111,9 +121,15 @@ async fn run() -> Result<(), AppError> {
     let args = Args::parse();
     info!("Starting braidpipe daemon...");
 
+    // Before anything touches the GStreamer registry: an explicit --hw wins
+    // over BRAIDPIPE_HW for both decoder promotion and encoder detection.
+    if let Some(hw) = args.hw.as_deref() {
+        braidpipe_engine::hwaccel::set_enabled(hw != "off");
+    }
+
     let sink = match args.output.as_deref() {
         Some(output) => {
-            let desc = preset::build_sink(&args.preset, output, args.fps)?;
+            let desc = preset::build_sink(&args.preset, output, args.fps, args.encoder.as_deref())?;
             info!(preset = %args.preset, sink = %desc, "Built sink from preset");
             desc
         }
