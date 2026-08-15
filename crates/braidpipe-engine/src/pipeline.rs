@@ -9,7 +9,19 @@ use tracing::{error, info, warn};
 
 /// Encoders whose src pads carry a meaningful DELTA_UNIT flag for keyframe
 /// counting. A whitelist, because "name contains enc" would match audio.
-const VIDEO_ENCODER_FACTORIES: [&str; 4] = ["x264enc", "vtenc_h264", "openh264enc", "vp9enc"];
+const VIDEO_ENCODER_FACTORIES: &[&str] = &[
+    "x264enc",
+    "vtenc_h264",
+    "vtenc_h264_hw",
+    "openh264enc",
+    "vp9enc",
+    "nvh264enc",
+    "vah264enc",
+    "vaapih264enc",
+    "qsvh264enc",
+    "mfh264enc",
+    "amfh264enc",
+];
 
 pub struct GStreamerEngine {
     pipeline: gstreamer::Pipeline,
@@ -44,6 +56,10 @@ impl GStreamerEngine {
         extra_branch: Option<&str>,
     ) -> Result<Self, EngineError> {
         gstreamer::init().map_err(|e| EngineError::BuildFailed(e.to_string()))?;
+
+        // Before any decodebin exists: raise the rank of the platform's GPU
+        // decoders so autoplugging prefers them (BRAIDPIPE_HW=off skips this).
+        crate::hwaccel::promote_hardware_decoders();
 
         // Pipeline description string using GStreamer launch syntax.
         // q_pass is leaky so that, while the AI branch is selected, buffers
@@ -91,6 +107,16 @@ impl GStreamerEngine {
         let pad_ai = input_selector
             .static_pad("sink_1")
             .ok_or_else(|| EngineError::BuildFailed("Missing sink_1 pad".into()))?;
+
+        // One log line per codec element actually in use. The rank promotion
+        // above only says what is *eligible*; this says what the stream is
+        // processed with. Encoders from the launch string already exist, so
+        // sweep once; decoders appear inside decodebin3 when the input's caps
+        // are known, which is what the signal catches.
+        pipeline.connect_deep_element_added(|_, _, element| Self::log_codec_element(element));
+        for element in pipeline.iterate_recurse().into_iter().flatten() {
+            Self::log_codec_element(&element);
+        }
 
         let (metric_queues, srt_elements) = Self::attach_metrics(&pipeline, &input_selector);
 
@@ -262,6 +288,33 @@ impl GStreamerEngine {
         }
 
         (metric_queues, srt_elements)
+    }
+
+    /// Logs a video encoder/decoder the pipeline is actually using, tagged
+    /// hardware or software from the factory's klass metadata.
+    fn log_codec_element(element: &gstreamer::Element) {
+        let Some(factory) = element.factory() else {
+            return;
+        };
+        let Some(klass) = factory.metadata(gstreamer::ELEMENT_METADATA_KLASS) else {
+            return;
+        };
+        if !klass.contains("Video") {
+            return;
+        }
+        let direction = if klass.contains("Decoder") {
+            "decoder"
+        } else if klass.contains("Encoder") {
+            "encoder"
+        } else {
+            return;
+        };
+        let implementation = if klass.contains("Hardware") {
+            "hardware"
+        } else {
+            "software"
+        };
+        info!(element = %factory.name(), "Video {direction} in use ({implementation})");
     }
 
     fn attach_mux_pts_probe(pad: &gstreamer::Pad) {
