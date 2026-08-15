@@ -169,6 +169,27 @@
         { "refId": "B", "expr": "rate(braidpipe_srt_packets_received_lost[30s])", "legendFormat": "loss/s {{element}}" },
         { "refId": "C", "expr": "rate(braidpipe_srt_packets_received_retransmitted[30s])", "legendFormat": "retrans/s {{element}}" }
       ]
+    },
+    {
+      "id": 20, "type": "timeseries", "title": "GPU utilization",
+      "description": "Machine-wide. Encoder/decoder series are the dedicated NVENC/NVDEC blocks and only exist on NVIDIA; on macOS only the device number is available. All series are absent on machines with no readable GPU counters.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "custom": { "fillOpacity": 12 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "braidpipe_gpu_utilization_percent", "legendFormat": "device" },
+        { "refId": "B", "expr": "braidpipe_gpu_encoder_utilization_percent", "legendFormat": "encoder (nvenc)" },
+        { "refId": "C", "expr": "braidpipe_gpu_decoder_utilization_percent", "legendFormat": "decoder (nvdec)" }
+      ]
+    },
+    {
+      "id": 21, "type": "timeseries", "title": "GPU memory",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "bytes", "min": 0 }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "braidpipe_gpu_memory_used_bytes", "legendFormat": "in use" }
+      ]
     }
   ]
 }

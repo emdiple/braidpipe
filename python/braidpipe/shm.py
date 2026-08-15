@@ -1,7 +1,9 @@
 import mmap
+import os
+import socket as socket_module
 import struct
+import time
 import numpy as np
-from multiprocessing import shared_memory
 
 # Slot State Constants matching Rust shm.rs
 SLOT_FREE = 0
@@ -20,19 +22,51 @@ SLOT_HEADER_FMT = "<B7xQQ"
 SLOT_HEADER_SIZE = struct.calcsize(SLOT_HEADER_FMT)
 assert SLOT_HEADER_SIZE == 24
 
+# The handshake: a worker announces itself with HELLO on the daemon's socket
+# and receives a datagram carrying the shared segment's fd as SCM_RIGHTS
+# ancillary data. The segment is anonymous -- the fd is the only way in.
+HELLO = b'{"type":"hello"}'
+
+
+def attach(sock: socket_module.socket, rust_sock_path: str, retry_interval: float = 1.0):
+    """Says hello to the daemon until it answers with the shared-memory fd.
+
+    `sock` must already be bound to this worker's own socket path, because the
+    daemon addresses its reply there. Retries forever, so a worker may start
+    before the daemon and simply wait for it.
+    """
+    previous_timeout = sock.gettimeout()
+    sock.settimeout(retry_interval)
+    try:
+        while True:
+            try:
+                sock.sendto(HELLO, rust_sock_path)
+            except OSError:
+                # The daemon is not up (no socket file yet); try again.
+                time.sleep(retry_interval)
+                continue
+            try:
+                _msg, fds, _flags, _addr = socket_module.recv_fds(sock, 512, 1)
+            except TimeoutError:
+                continue
+            except OSError:
+                time.sleep(retry_interval)
+                continue
+            if fds:
+                return SharedMemoryManager(fds[0])
+            # A frame notification that raced the handshake; ignore it. The
+            # daemon passes those frames through unchanged.
+    finally:
+        sock.settimeout(previous_timeout)
+
+
 class SharedMemoryManager:
-    def __init__(self, shm_name: str = "braidpipe_buffer"):
-        # Strip leading slash/path if passed from CLI/defaults
-        clean_name = shm_name.lstrip("/").replace("dev/shm/", "")
-        
-        # Attach to POSIX shared memory created by Rust (works on Linux & macOS).
-        # track=False (Python 3.13+) stops the resource tracker from unlinking
-        # the Rust-owned segment when this process exits.
-        try:
-            self.shm_obj = shared_memory.SharedMemory(name=clean_name, track=False)
-        except TypeError:
-            self.shm_obj = shared_memory.SharedMemory(name=clean_name)
-        self.shm = self.shm_obj.buf
+    def __init__(self, fd: int):
+        # The fd received from the daemon describes the whole segment; its
+        # size comes from the fd itself, and everything else from the header.
+        size = os.fstat(fd).st_size
+        self.shm = mmap.mmap(fd, size)
+        os.close(fd)  # the mapping keeps the segment alive on its own
 
         # Unpack header metadata
         header_bytes = bytes(self.shm[:HEADER_SIZE])
@@ -50,7 +84,7 @@ class SharedMemoryManager:
         slot_offset = HEADER_SIZE + (slot_idx * self.slot_size)
         payload_offset = slot_offset + SLOT_HEADER_SIZE
         payload_bytes = self.width * self.height * self.channels
-        
+
         # Point NumPy directly to the shared memory buffer slice
         return np.ndarray(
             shape=(self.height, self.width, self.channels),
@@ -75,4 +109,4 @@ class SharedMemoryManager:
         self.shm[slot_offset] = SLOT_FREE
 
     def close(self):
-        self.shm_obj.close()
+        self.shm.close()

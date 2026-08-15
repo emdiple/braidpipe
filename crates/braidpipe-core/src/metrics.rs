@@ -188,6 +188,15 @@ pub static WORKER_LAST_EXIT_CODE: Gauge = Gauge::new(0);
 pub static WORKER_CPU_SECONDS: GaugeF = GaugeF::new();
 pub static WORKER_RSS_BYTES: Gauge = Gauge::new(0);
 
+// GPU (updated by the daemon's GPU sampler; -1 = the platform offers no
+// unprivileged counter for it, and the series is omitted rather than lying).
+// Machine-wide numbers, not per-process: no platform attributes GPU time to a
+// process without root, and on a streaming box the pipeline is the main user.
+pub static GPU_UTILIZATION: Gauge = Gauge::new(-1);
+pub static GPU_ENCODER_UTILIZATION: Gauge = Gauge::new(-1);
+pub static GPU_DECODER_UTILIZATION: Gauge = Gauge::new(-1);
+pub static GPU_MEMORY_USED_BYTES: Gauge = Gauge::new(-1);
+
 // Media path (updated by GStreamer pad probes in the engine)
 pub static INPUT_FRAMES: Counter = Counter::new();
 pub static INPUT_INTERVAL_SECONDS: Histogram = Histogram::new();
@@ -258,7 +267,7 @@ pub fn render(out: &mut String) {
     let _ = writeln!(out, "braidpipe_branch_seconds_total{{branch=\"ai\"}} {}", BRANCH_SECONDS_AI.seconds());
     let _ = writeln!(out, "braidpipe_branch_seconds_total{{branch=\"passthrough\"}} {}", BRANCH_SECONDS_PASSTHROUGH.seconds());
 
-    gauge!("braidpipe_worker_up", "1 while the Python worker process is running", WORKER_UP.get());
+    gauge!("braidpipe_worker_up", "1 while the worker is running (managed) or recently delivering frames (external)", WORKER_UP.get());
     counter!("braidpipe_worker_exits_total", "Times the worker process has exited", "" => WORKER_EXITS);
     gauge!("braidpipe_worker_last_exit_code", "Exit code of the most recent worker exit", WORKER_LAST_EXIT_CODE.get());
     gauge!("braidpipe_worker_cpu_seconds_total", "Cumulative CPU time of the worker process", WORKER_CPU_SECONDS.get());
@@ -285,6 +294,21 @@ pub fn render(out: &mut String) {
     );
     if v >= 0 && a >= 0 {
         gauge!("braidpipe_av_skew_seconds", "Video minus audio PTS at the muxer", (v - a) as f64 / 1e6);
+    }
+
+    // GPU series appear only where the platform can actually measure them:
+    // an absent series is honest, a fake zero looks like an idle GPU.
+    if GPU_UTILIZATION.get() >= 0 {
+        gauge!("braidpipe_gpu_utilization_percent", "Machine-wide GPU utilization", GPU_UTILIZATION.get());
+    }
+    if GPU_ENCODER_UTILIZATION.get() >= 0 {
+        gauge!("braidpipe_gpu_encoder_utilization_percent", "Hardware video encoder (NVENC) utilization", GPU_ENCODER_UTILIZATION.get());
+    }
+    if GPU_DECODER_UTILIZATION.get() >= 0 {
+        gauge!("braidpipe_gpu_decoder_utilization_percent", "Hardware video decoder (NVDEC) utilization", GPU_DECODER_UTILIZATION.get());
+    }
+    if GPU_MEMORY_USED_BYTES.get() >= 0 {
+        gauge!("braidpipe_gpu_memory_used_bytes", "GPU memory in use, machine-wide", GPU_MEMORY_USED_BYTES.get());
     }
 }
 

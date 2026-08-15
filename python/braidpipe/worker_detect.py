@@ -40,7 +40,7 @@ import time
 
 import cv2
 import numpy as np
-from shm import SharedMemoryManager
+from shm import attach
 
 RUST_SOCK = os.environ.get("BRAIDPIPE_RUST_SOCK", "/tmp/braidpipe_rust.sock")
 PYTHON_SOCK = os.environ.get("BRAIDPIPE_PYTHON_SOCK", "/tmp/braidpipe_python.sock")
@@ -142,12 +142,14 @@ def run_worker(rust_sock_path: str, python_sock_path: str) -> None:
     if os.path.exists(python_sock_path):
         os.remove(python_sock_path)
 
-    shm = SharedMemoryManager()
     detector = Detector(MODEL, CONF)
     detector.start()
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     sock.bind(python_sock_path)
+
+    # Handshake: the daemon answers our hello with the shared-memory fd.
+    shm = attach(sock, rust_sock_path)
     print(
         f"[detect] attached to SHM ({shm.width}x{shm.height} @ {shm.channels}ch), "
         f"model={MODEL} conf={CONF}",
@@ -157,6 +159,8 @@ def run_worker(rust_sock_path: str, python_sock_path: str) -> None:
     try:
         while True:
             packet = json.loads(sock.recvfrom(512)[0])
+            if "frame_id" not in packet:
+                continue  # a control packet, e.g. a duplicate handshake reply
             frame_id = packet["frame_id"]
             slot_idx = packet["slot_index"]
             started = time.perf_counter_ns()

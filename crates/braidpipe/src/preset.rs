@@ -5,10 +5,13 @@
 //! environment variable, so a deployment can start from `lowlatency` and turn
 //! one knob without writing the whole GStreamer sink by hand:
 //!
-//!   BRAIDPIPE_ENCODER       x264 | vtenc
+//!   BRAIDPIPE_ENCODER       auto | x264 | vtenc | nvenc | va | vaapi | qsv | mf | amf
+//!   BRAIDPIPE_HW            off disables GPU decode promotion and encoder auto-pick
 //!   BRAIDPIPE_BITRATE_KBPS  encoder target bitrate
 //!   BRAIDPIPE_SPEED_PRESET  x264 speed preset (ultrafast..placebo)
-//!   BRAIDPIPE_ZEROLATENCY   1/0, x264 tune=zerolatency / vtenc realtime
+//!   BRAIDPIPE_ZEROLATENCY   1/0, per encoder: x264 tune=zerolatency, vtenc
+//!                           realtime, nvenc low-latency preset, qsv/mf
+//!                           low-latency, amf ultra-low-latency usage
 //!   BRAIDPIPE_GOP_SECONDS   keyframe interval in seconds
 //!   BRAIDPIPE_VBV_BUF_MS    x264 VBV buffer, bounds bitrate bursts
 //!   BRAIDPIPE_SINK_SYNC     1/0, clock-sync the network sink
@@ -47,20 +50,72 @@ pub struct Params {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoder {
+    /// Software fallback, available everywhere.
     X264,
+    /// Apple VideoToolbox (macOS).
     Vtenc,
+    /// NVIDIA NVENC (Linux, Windows).
+    Nvenc,
+    /// VA-API through the modern `va` plugin (Linux).
+    Va,
+    /// VA-API through the legacy `vaapi` plugin (Linux).
+    Vaapi,
+    /// Intel QuickSync (Linux, Windows).
+    Qsv,
+    /// Windows Media Foundation.
+    Mf,
+    /// AMD AMF (Windows).
+    Amf,
 }
 
-impl fmt::Display for Encoder {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Encoder::X264 => "x264",
-            Encoder::Vtenc => "vtenc",
+impl Encoder {
+    const NAMES: [(&'static str, Encoder); 8] = [
+        ("x264", Encoder::X264),
+        ("vtenc", Encoder::Vtenc),
+        ("nvenc", Encoder::Nvenc),
+        ("va", Encoder::Va),
+        ("vaapi", Encoder::Vaapi),
+        ("qsv", Encoder::Qsv),
+        ("mf", Encoder::Mf),
+        ("amf", Encoder::Amf),
+    ];
+
+    fn from_name(name: &str) -> Option<Encoder> {
+        Self::NAMES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, e)| *e)
+    }
+
+    /// Maps a GStreamer factory name reported by hardware detection.
+    fn from_factory(factory: &str) -> Option<Encoder> {
+        Some(match factory {
+            "vtenc_h264" => Encoder::Vtenc,
+            "nvh264enc" => Encoder::Nvenc,
+            "vah264enc" => Encoder::Va,
+            "vaapih264enc" => Encoder::Vaapi,
+            "qsvh264enc" => Encoder::Qsv,
+            "mfh264enc" => Encoder::Mf,
+            "amfh264enc" => Encoder::Amf,
+            _ => return None,
         })
     }
 }
 
+impl fmt::Display for Encoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (name, _) = Self::NAMES.iter().find(|(_, e)| e == self).unwrap();
+        f.write_str(name)
+    }
+}
+
 pub const PRESET_NAMES: [&str; 4] = ["zerolatency", "lowlatency", "balanced", "bandwidth"];
+
+/// Accepted values for the `--encoder` CLI flag: "auto" plus every pinnable
+/// encoder name. Kept in sync with [`Encoder::NAMES`] by a test.
+pub const ENCODER_VALUES: [&str; 9] = [
+    "auto", "x264", "vtenc", "nvenc", "va", "vaapi", "qsv", "mf", "amf",
+];
 
 /// Profile defaults. Bitrates assume 720p30; override for other formats.
 fn defaults(preset: &str) -> Option<Params> {
@@ -117,8 +172,41 @@ fn defaults(preset: &str) -> Option<Params> {
 
 /// Builds the sink description for a preset and an output URL
 /// (rtmp://, srt:// or udp://host:port), env overrides applied.
-pub fn build_sink(preset: &str, output: &str, fps: u32) -> Result<String, String> {
-    let params = resolve(preset, |key| std::env::var(key).ok())?;
+///
+/// `encoder` is the `--encoder` CLI flag. Precedence: a non-auto flag pins
+/// the codec outright; an explicit `--encoder auto` forces detection even
+/// over BRAIDPIPE_ENCODER; no flag defers to the environment; and with
+/// nothing pinned anywhere, the best hardware encoder this machine actually
+/// has replaces the preset's x264 default (None from detection means no GPU
+/// encoder or GPU mode off, and x264 stands).
+pub fn build_sink(
+    preset: &str,
+    output: &str,
+    fps: u32,
+    encoder: Option<&str>,
+) -> Result<String, String> {
+    let mut params = resolve(preset, |key| std::env::var(key).ok())?;
+
+    let pinned = match encoder {
+        Some("auto") => false,
+        Some(name) => {
+            params.encoder = Encoder::from_name(name).ok_or_else(|| {
+                format!(
+                    "--encoder must be one of {}; got '{name}'",
+                    ENCODER_VALUES.join(", ")
+                )
+            })?;
+            true
+        }
+        None => std::env::var("BRAIDPIPE_ENCODER").is_ok_and(|v| v != "auto"),
+    };
+    if !pinned
+        && let Some(detected) =
+            braidpipe_engine::hwaccel::preferred_h264_encoder().and_then(Encoder::from_factory)
+    {
+        params.encoder = detected;
+    }
+
     render(&params, output, fps)
 }
 
@@ -136,11 +224,16 @@ fn resolve(
     })?;
 
     if let Some(v) = env("BRAIDPIPE_ENCODER") {
-        p.encoder = match v.as_str() {
-            "x264" => Encoder::X264,
-            "vtenc" => Encoder::Vtenc,
-            other => return Err(format!("BRAIDPIPE_ENCODER must be x264 or vtenc, got '{other}'")),
-        };
+        // "auto" keeps the default; build_sink() then swaps in the detected
+        // hardware encoder, exactly as if the variable were unset.
+        if v != "auto" {
+            p.encoder = Encoder::from_name(&v).ok_or_else(|| {
+                format!(
+                    "BRAIDPIPE_ENCODER must be one of auto, {}; got '{v}'",
+                    Encoder::NAMES.map(|(n, _)| n).join(", ")
+                )
+            })?;
+        }
     }
     if let Some(v) = env("BRAIDPIPE_SPEED_PRESET") {
         // x264enc rejects bad values itself; leaking the string through keeps
@@ -184,6 +277,40 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
             "vtenc_h264 realtime={} allow-frame-reordering={} bitrate={} \
              max-keyframe-interval={keyint}",
             p.zerolatency, !p.zerolatency, p.bitrate_kbps
+        ),
+        // The hardware encoders below all take kbps like x264, but each has
+        // its own name for the GOP and its own shape of low-latency switch.
+        // The VBV bound carries over where the encoder exposes one (NVENC's
+        // vbv-buffer-size, VA's cpb-size, both in kbit).
+        Encoder::Nvenc => format!(
+            "nvh264enc bitrate={} gop-size={keyint} rc-mode=cbr preset={} \
+             vbv-buffer-size={}",
+            p.bitrate_kbps,
+            if p.zerolatency { "low-latency-hq" } else { "hq" },
+            p.bitrate_kbps * p.vbv_buf_ms / 1000
+        ),
+        Encoder::Va => format!(
+            "vah264enc bitrate={} key-int-max={keyint} target-usage={} cpb-size={}",
+            p.bitrate_kbps,
+            if p.zerolatency { 6 } else { 4 },
+            p.bitrate_kbps * p.vbv_buf_ms / 1000
+        ),
+        Encoder::Vaapi => format!(
+            "vaapih264enc bitrate={} keyframe-period={keyint}",
+            p.bitrate_kbps
+        ),
+        Encoder::Qsv => format!(
+            "qsvh264enc bitrate={} gop-size={keyint} low-latency={}",
+            p.bitrate_kbps, p.zerolatency
+        ),
+        Encoder::Mf => format!(
+            "mfh264enc bitrate={} gop-size={keyint} low-latency={}",
+            p.bitrate_kbps, p.zerolatency
+        ),
+        Encoder::Amf => format!(
+            "amfh264enc bitrate={} gop-size={keyint} usage={}",
+            p.bitrate_kbps,
+            if p.zerolatency { "ultra-low-latency" } else { "transcoding" }
         ),
     };
 
@@ -356,6 +483,60 @@ mod tests {
         })
         .unwrap();
         assert_eq!(replaced, "decoder. ! fakesink");
+    }
+
+    #[test]
+    fn hardware_encoders_map_the_shared_params() {
+        let with_encoder = |name: &'static str| {
+            let p = resolve("lowlatency", move |key| {
+                (key == "BRAIDPIPE_ENCODER").then(|| name.to_string())
+            })
+            .unwrap();
+            render(&p, "srt://127.0.0.1:8888", 30).unwrap()
+        };
+
+        // lowlatency: 4500 kbps, 2s GOP at 30fps = 60, 200ms VBV = 900 kbit.
+        let nvenc = with_encoder("nvenc");
+        assert!(nvenc.contains(
+            "nvh264enc bitrate=4500 gop-size=60 rc-mode=cbr preset=low-latency-hq \
+             vbv-buffer-size=900"
+        ));
+
+        let va = with_encoder("va");
+        assert!(va.contains("vah264enc bitrate=4500 key-int-max=60 target-usage=6 cpb-size=900"));
+
+        assert!(with_encoder("vaapi").contains("vaapih264enc bitrate=4500 keyframe-period=60"));
+        assert!(with_encoder("qsv").contains("qsvh264enc bitrate=4500 gop-size=60 low-latency=true"));
+        assert!(with_encoder("mf").contains("mfh264enc bitrate=4500 gop-size=60 low-latency=true"));
+        assert!(with_encoder("amf")
+            .contains("amfh264enc bitrate=4500 gop-size=60 usage=ultra-low-latency"));
+    }
+
+    #[test]
+    fn auto_encoder_keeps_the_preset_default_for_later_detection() {
+        let p = resolve("lowlatency", |key| {
+            (key == "BRAIDPIPE_ENCODER").then(|| "auto".to_string())
+        })
+        .unwrap();
+        assert_eq!(p.encoder, Encoder::X264);
+    }
+
+    #[test]
+    fn cli_encoder_values_match_the_enum() {
+        assert_eq!(ENCODER_VALUES[0], "auto");
+        assert_eq!(ENCODER_VALUES.len(), Encoder::NAMES.len() + 1);
+        for (name, encoder) in Encoder::NAMES {
+            assert!(ENCODER_VALUES.contains(&name));
+            assert_eq!(Encoder::from_name(name), Some(encoder));
+        }
+    }
+
+    #[test]
+    fn factory_names_round_trip_to_encoders() {
+        assert_eq!(Encoder::from_factory("nvh264enc"), Some(Encoder::Nvenc));
+        assert_eq!(Encoder::from_factory("vtenc_h264"), Some(Encoder::Vtenc));
+        assert_eq!(Encoder::from_factory("vah264enc"), Some(Encoder::Va));
+        assert_eq!(Encoder::from_factory("x264enc"), None);
     }
 
     #[test]

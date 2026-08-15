@@ -162,6 +162,171 @@ pub fn spawn_worker_sampler(pid: u32) {
     });
 }
 
+/// Samples machine-wide GPU utilization every 5 seconds, through whatever
+/// unprivileged interface the platform has:
+///
+/// - macOS: `ioreg -r -d 1 -c IOAccelerator` -- the accelerator driver's
+///   PerformanceStatistics, readable without root (powermetrics is not).
+/// - Linux/NVIDIA: `nvidia-smi`, which also breaks out the dedicated NVENC/
+///   NVDEC blocks -- the numbers that actually say whether hardware
+///   encode/decode is doing the work.
+/// - Linux/AMD: the amdgpu sysfs files.
+///
+/// Gauges the platform cannot fill stay at -1 and are never rendered.
+pub fn spawn_gpu_sampler() {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            ticker.tick().await;
+            if !gpu::sample().await {
+                info!("No readable GPU counters on this machine; GPU metrics disabled");
+                return;
+            }
+        }
+    });
+}
+
+mod gpu {
+    use braidpipe_core::metrics;
+
+    /// Takes one sample and stores it in the gauges.
+    /// Returns false when this platform has nothing to read.
+    #[cfg(target_os = "macos")]
+    pub async fn sample() -> bool {
+        let output = tokio::process::Command::new("ioreg")
+            .args(["-r", "-d", "1", "-c", "IOAccelerator"])
+            .output()
+            .await;
+        let Ok(output) = output else { return false };
+        let text = String::from_utf8_lossy(&output.stdout);
+        let Some((utilization, memory)) = parse_ioreg(&text) else {
+            return false;
+        };
+        metrics::GPU_UTILIZATION.set(utilization);
+        metrics::GPU_MEMORY_USED_BYTES.set(memory);
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn sample() -> bool {
+        // NVIDIA first: nvidia-smi only exists when the driver does.
+        let output = tokio::process::Command::new("nvidia-smi")
+            .args([
+                "--query-gpu=utilization.gpu,utilization.encoder,utilization.decoder,memory.used",
+                "--format=csv,noheader,nounits",
+            ])
+            .output()
+            .await;
+        if let Ok(output) = output
+            && output.status.success()
+            && let Some((gpu, encoder, decoder, memory_mib)) =
+                parse_nvidia_csv(&String::from_utf8_lossy(&output.stdout))
+        {
+            metrics::GPU_UTILIZATION.set(gpu);
+            metrics::GPU_ENCODER_UTILIZATION.set(encoder);
+            metrics::GPU_DECODER_UTILIZATION.set(decoder);
+            metrics::GPU_MEMORY_USED_BYTES.set(memory_mib * 1024 * 1024);
+            return true;
+        }
+
+        // amdgpu (and some others) publish a plain busy percentage in sysfs.
+        for card in ["card0", "card1"] {
+            let device = format!("/sys/class/drm/{card}/device");
+            if let Ok(busy) = std::fs::read_to_string(format!("{device}/gpu_busy_percent"))
+                && let Ok(percent) = busy.trim().parse::<i64>()
+            {
+                metrics::GPU_UTILIZATION.set(percent);
+                if let Ok(vram) = std::fs::read_to_string(format!("{device}/mem_info_vram_used"))
+                    && let Ok(bytes) = vram.trim().parse::<i64>()
+                {
+                    metrics::GPU_MEMORY_USED_BYTES.set(bytes);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub async fn sample() -> bool {
+        false
+    }
+
+    /// Pulls "Device Utilization %" (max across accelerators) and
+    /// "In use system memory" (summed) out of ioreg's plist-ish text.
+    #[cfg(any(target_os = "macos", test))]
+    pub fn parse_ioreg(text: &str) -> Option<(i64, i64)> {
+        let mut utilization: Option<i64> = None;
+        let mut memory: i64 = 0;
+        for (key, value) in extract_numeric_fields(text) {
+            match key {
+                "Device Utilization %" => {
+                    utilization = Some(utilization.unwrap_or(0).max(value));
+                }
+                "In use system memory" => memory += value,
+                _ => {}
+            }
+        }
+        utilization.map(|u| (u, memory))
+    }
+
+    /// Collects every `"key"=1234` pair in the ioreg dump, including those
+    /// nested inside a single-line PerformanceStatistics dictionary.
+    #[cfg(any(target_os = "macos", test))]
+    fn extract_numeric_fields(text: &str) -> Vec<(&str, i64)> {
+        let parts: Vec<&str> = text.split('"').collect();
+        parts
+            .windows(3)
+            .filter_map(|w| {
+                let value = w[2].strip_prefix('=').and_then(|rest| {
+                    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                    digits.parse::<i64>().ok()
+                })?;
+                Some((w[1], value))
+            })
+            .collect()
+    }
+
+    /// Parses one line of `nvidia-smi --format=csv,noheader,nounits`:
+    /// `12, 34, 5, 1234` -> (gpu%, encoder%, decoder%, memory MiB).
+    /// Multi-GPU boxes report the first device.
+    #[cfg(any(target_os = "linux", test))]
+    pub fn parse_nvidia_csv(text: &str) -> Option<(i64, i64, i64, i64)> {
+        let mut fields = text
+            .lines()
+            .next()?
+            .split(',')
+            .map(|f| f.trim().parse::<i64>());
+        match (
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+        ) {
+            (Ok(gpu), Ok(encoder), Ok(decoder), Ok(memory)) => {
+                Some((gpu, encoder, decoder, memory))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// External worker mode: `worker_up` cannot mean "my child is alive" for a
+/// process the daemon does not own, so it means "delivered a successful AI
+/// frame within the last 2 seconds" instead, derived from the timestamp the
+/// relay already records on every good roundtrip.
+pub fn spawn_external_worker_probe() {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            ticker.tick().await;
+            let last = metrics::LAST_AI_FRAME_TIMESTAMP.get();
+            let up = last > 0.0 && metrics::unix_now() - last < 2.0;
+            metrics::WORKER_UP.set(i64::from(up));
+        }
+    });
+}
+
 /// Marks the daemon down and keeps serving long enough for Prometheus to
 /// scrape that final state.
 ///
@@ -238,6 +403,7 @@ fn parse_cputime(text: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    use super::gpu::{parse_ioreg, parse_nvidia_csv};
     use super::parse_cputime;
 
     #[test]
@@ -246,5 +412,28 @@ mod tests {
         assert_eq!(parse_cputime("2:15:04"), Some(8104.0));
         assert_eq!(parse_cputime("1-00:00:30"), Some(86_430.0));
         assert_eq!(parse_cputime("garbage"), None);
+    }
+
+    #[test]
+    fn ioreg_utilization_is_maxed_and_memory_summed() {
+        // Two accelerators on one line each, the way ioreg prints nested
+        // PerformanceStatistics dictionaries.
+        let text = r#"
+          | "PerformanceStatistics" = {"Device Utilization %"=28,"Renderer Utilization %"=27,"In use system memory"=39124992}
+          | "PerformanceStatistics" = {"Device Utilization %"=11,"In use system memory"=1000}
+        "#;
+        assert_eq!(parse_ioreg(text), Some((28, 39_125_992)));
+        assert_eq!(parse_ioreg("no gpu fields here"), None);
+    }
+
+    #[test]
+    fn nvidia_csv_first_gpu_wins() {
+        assert_eq!(parse_nvidia_csv("12, 34, 5, 1234\n"), Some((12, 34, 5, 1234)));
+        assert_eq!(
+            parse_nvidia_csv("7, 0, 0, 512\n90, 90, 90, 9999\n"),
+            Some((7, 0, 0, 512))
+        );
+        assert_eq!(parse_nvidia_csv("[N/A], [N/A], [N/A], 512\n"), None);
+        assert_eq!(parse_nvidia_csv(""), None);
     }
 }
