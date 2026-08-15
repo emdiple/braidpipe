@@ -180,6 +180,10 @@ async fn run() -> Result<(), AppError> {
         )?,
     });
 
+    // GPU utilization is worth watching in every mode -- hardware decode runs
+    // even in passthrough -- and costs one 0.2 Hz sampler.
+    metrics_server::spawn_gpu_sampler();
+
     if args.passthrough_only {
         info!("Starting in passthrough-only mode");
         let collector_engine = Arc::clone(&engine);
