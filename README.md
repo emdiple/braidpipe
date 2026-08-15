@@ -322,6 +322,7 @@ If the source has no audio stream, don't pass `--audio` — the audio branch wou
 | `--width <N>` / `--height <N>` | `1280` / `720` | Shared-memory slot geometry |
 | `--rust-sock <PATH>` | `/tmp/braidpipe_rust.sock` | Where the daemon listens for acks and hellos |
 | `--python-sock <PATH>` | `/tmp/braidpipe_python.sock` | Where the worker listens for notifications |
+| `--worker-listen <IP:PORT>` | — | Also accept workers from other machines (tcp-raw), see [Workers on another machine](#workers-on-another-machine-tcp-raw) |
 | `--passthrough-only` | off | Media path only; no worker, no shared memory |
 | `--metrics-port <N>` | `9184` | Prometheus endpoint on 127.0.0.1, see [Monitoring](#monitoring); `0` disables |
 | `--metrics-drain-ms <N>` | `2000` | How long to keep serving metrics after a shutdown signal, so the down state gets scraped |
@@ -436,11 +437,44 @@ In this mode nothing picks the interpreter for you — managed mode's automatic 
 
 One metric changes meaning: the daemon can't know whether a process it doesn't own is alive, so in this mode `braidpipe_worker_up` means "delivered a successful AI frame within the last 2 seconds" rather than "my child process is running", and `worker_exits_total` / `worker_last_exit_code` / CPU / RSS are never populated.
 
-For a containerized worker only the socket directory must cross the container boundary — mount it and the fd handshake does the rest, because a file descriptor passed over a Unix socket works across container namespaces with no `/dev/shm` mount or `--ipc=host` required. On macOS, Docker runs inside a VM, so neither sockets nor memory can cross — external mode there means a host process, not a container.
+For a containerized worker only the socket directory must cross the container boundary — mount it and the fd handshake does the rest, because a file descriptor passed over a Unix socket works across container namespaces with no `/dev/shm` mount or `--ipc=host` required. On macOS, Docker runs inside a VM, so neither sockets nor memory can cross — external mode there means a host process, not a container (or a worker using the tcp-raw transport below, which crosses anything TCP crosses).
+
+### Workers on another machine (tcp-raw)
+
+`--worker-listen IP:PORT` opens the worker negotiation to the network: UDP on that address answers hellos with a config packet, and TCP on the same port carries raw frames both ways. Same-host shm workers keep working alongside it — the transport is chosen per worker by where its hello arrives.
+
+```bash
+# machine A — the daemon
+cargo run -p braidpipe --release -- --external-worker --worker-listen 0.0.0.0:7300
+
+# machine B — any bundled worker, pointed at the daemon
+BRAIDPIPE_DAEMON=192.168.1.10:7300 python3 worker_edges.py
+```
+
+The worker's hello (`{"type": "hello", "transports": ["tcp-raw"]}`) is answered with `{"type": "config", "transport": "tcp-raw", "data_port": …, "width": …, "height": …, "channels": …, "format": "rgb"}`. The worker then opens one TCP connection to `data_port`, and every frame in either direction is a fixed 24-byte header plus the raw pixels — [python/braidpipe/remote.py](python/braidpipe/remote.py) wraps this in the same attach-and-loop shape the shm side has:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `frame_id` | `u64` LE | Matches the result to the frame |
+| `time_us` | `u64` LE | Capture timestamp toward the worker; processing time on the way back |
+| `payload_len` | `u32` LE | Always `width × height × channels` |
+| `slot` | `u8` | Echo back unchanged; names the daemon-side slot |
+| `flags` | `u8` + 2 pad | Bit 0 = success, on results |
+
+Sending the result back **is** the ack — there are no separate datagrams. On the daemon side the result lands in the same shm slot a local worker would have written, so the relay, the deadline, and the watchdog treat both transports identically, and failover behaves exactly as in [External worker mode](#external-worker-mode): worker dies → passthrough within the failure streak, reconnect → AI branch on the first good frame. Backpressure is drop, not buffer: a frame that cannot be sent within one deadline tears the connection down rather than queueing stale video.
+
+The frames are uncompressed, which makes bandwidth the deciding constraint — frames cross the wire twice (out and back):
+
+| Geometry | Round trip @ 30 fps | Verdict |
+| --- | --- | --- |
+| 1280×720×3 (default) | ~1.3 Gbit/s | 2.5 GbE or better; a quiet gigabit link will drop frames |
+| 1920×1080×3 | ~3.0 Gbit/s | 10 GbE territory |
+
+Wire time also eats into the 1.5-frame deadline (a 720p frame takes ~24 ms each way on gigabit, ~2 ms on 10 GbE), so this transport wants a fast LAN. For constrained networks, run the worker's machine as an SRT hop with its own braidpipe instead — or wait for a compressed transport. Since tcp-raw is ordinary TCP/UDP, it also crosses boundaries the fd handshake cannot: a Docker container on macOS (publish the port with `-p 7300:7300 -p 7300:7300/udp`) or any VM.
 
 ## The IPC contract
 
-**Shared memory** — one *anonymous* segment (a `memfd` on Linux, an unlinked POSIX object elsewhere) holding a 32-byte header followed by `slot_count` slots. Each slot is a 24-byte header plus `width × height × channels` bytes of pixels. The segment has no name anywhere: a worker gets in by sending `{"type": "hello"}` to the daemon's socket, and the daemon replies with a datagram (body `{"type": "shm_fd"}`) carrying the segment's file descriptor as `SCM_RIGHTS` ancillary data. The kernel duplicates the descriptor into the worker, which `fstat`s it for the size and `mmap`s it. Because nothing is ever named, nothing can collide between instances, go stale after a crash, or need permission juggling — the kernel frees the segment when the last descriptor and mapping are gone. A worker may say hello before the daemon is up (retry until answered) or at any point after; replies are sent whenever frames are flowing.
+**Shared memory** — one *anonymous* segment (a `memfd` on Linux, an unlinked POSIX object elsewhere) holding a 32-byte header followed by `slot_count` slots. Each slot is a 24-byte header plus `width × height × channels` bytes of pixels. The segment has no name anywhere: a worker gets in by sending `{"type": "hello"}` to the daemon's socket (optionally with a `"transports"` list; over UDS the answer is always shm), and the daemon replies with a config datagram (body `{"type": "config", "transport": "shm", …}` describing the ring geometry) carrying the segment's file descriptor as `SCM_RIGHTS` ancillary data. The kernel duplicates the descriptor into the worker, which `fstat`s it for the size and `mmap`s it. Because nothing is ever named, nothing can collide between instances, go stale after a crash, or need permission juggling — the kernel frees the segment when the last descriptor and mapping are gone. A worker may say hello before the daemon is up (retry until answered) or at any point after; replies are sent whenever frames are flowing.
 
 All layouts are explicitly padded on the Rust side and mirrored by `struct` format strings in [python/braidpipe/shm.py](python/braidpipe/shm.py), which assert their own sizes at import — a mismatch fails loudly instead of silently reading garbage.
 
