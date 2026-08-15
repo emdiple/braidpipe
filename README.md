@@ -48,6 +48,7 @@ The `input-selector` decides, frame by frame, whether the viewer sees the AI bra
 - [Quick start](#quick-start)
 - [Real-world pipelines](#real-world-pipelines)
 - [Output presets](#output-presets)
+- [GPU acceleration](#gpu-acceleration)
 - [Audio passthrough](#audio-passthrough)
 - [Command-line reference](#command-line-reference)
 - [Writing a Python worker](#writing-a-python-worker)
@@ -211,7 +212,8 @@ Bitrates assume 720p30 — scale them for other formats. A preset only decides d
 
 | Variable | Overrides | Values |
 | --- | --- | --- |
-| `BRAIDPIPE_ENCODER` | encoder | `x264` (default) or `vtenc` (macOS VideoToolbox) |
+| `BRAIDPIPE_ENCODER` | encoder | `auto` (default — best GPU encoder, else x264), `x264`, `vtenc`, `nvenc`, `va`, `vaapi`, `qsv`, `mf`, `amf` — see [GPU acceleration](#gpu-acceleration) |
+| `BRAIDPIPE_HW` | GPU decode/encode detection | `off` forces software both ways |
 | `BRAIDPIPE_BITRATE_KBPS` | target bitrate | kbps |
 | `BRAIDPIPE_SPEED_PRESET` | x264 speed preset | `ultrafast` … `placebo` |
 | `BRAIDPIPE_ZEROLATENCY` | zero-latency tuning | `1`/`0` — x264 `tune=zerolatency`, vtenc `realtime` |
@@ -244,6 +246,36 @@ Three things worth reading out of that table:
 - **`lowlatency` and `balanced` hold their targets to within 1%,** and no preset's worst 250 ms burst exceeds its target by more than 10% — that is the VBV bound doing its job. Provision the link for the target plus ~10% and it will not be surprised.
 - **`zerolatency` runs ~15% under target on hard content.** The 100 ms VBV is tight enough to constrain ABR itself, trading a little quality for the strictest burst bound. That is the correct trade for its use case.
 - **`bandwidth` spends almost nothing on this content, and that is by design, not a bug.** Without `tune=zerolatency`, x264's mbtree lookahead rates every block by how much future frames can predict from it — and noise predicts nothing, so mbtree declines to encode it. The synthetic content is 30% noise; real footage has structure everywhere and will sit far closer to target. Either way the target is a hard ceiling, never a floor: this preset buys quality-per-bit, not constant bandwidth. (On pure noise — `BRAIDPIPE_BW_PATTERN=snow` — the effect is even starker, while the three zerolatency presets still hold their caps, since zerolatency disables mbtree.)
+
+## GPU acceleration
+
+On a machine with a capable GPU, both halves of the codec work move off the CPU automatically. The mechanism differs per platform because every OS has its own video API:
+
+| Platform | Decode | Encode (H.264, first available wins) |
+| --- | --- | --- |
+| macOS | VideoToolbox (`vtdec_hw`, `vtdec`) | VideoToolbox (`vtenc_h264`) |
+| Linux | NVDEC → VA-API (`va` plugin, then legacy `vaapi`) → QuickSync | `nvh264enc` → `vah264enc` → `qsvh264enc` → `vaapih264enc` |
+| Windows | Direct3D 12 → Direct3D 11 → NVDEC → QuickSync | `nvh264enc` → `qsvh264enc` → `amfh264enc` → `mfh264enc` |
+
+**Decoding** needs no pipeline changes at all. `decodebin3` picks decoders by element rank, so at startup the daemon promotes the platform's hardware decoders above the software `avdec_*` family and autoplugging does the rest — for any codec the source carries, on both `--uri` and custom `--source` pipelines that use a decodebin. The `Hardware decoders promoted for autoplugging` log line lists what was found. Frames still land in system memory for the AI branch, which needs the raw pixels anyway: the win is the decode itself, not zero-copy.
+
+Either way, the daemon logs every codec element the pipeline actually ends up using, tagged hardware or software — the encoder at startup, the decoder as soon as the input's caps are known:
+
+```
+INFO braidpipe_engine::pipeline: Video encoder in use (hardware) element=vtenc_h264
+INFO braidpipe_engine::pipeline: Video decoder in use (hardware) element=vtdec_hw
+```
+
+Whether the GPU is then actually doing work shows up in [Monitoring](#monitoring): `braidpipe_gpu_utilization_percent` samples machine-wide GPU load every 5 seconds (via `ioreg` on macOS, `nvidia-smi` or the amdgpu sysfs on Linux), NVIDIA additionally breaks out the dedicated `_encoder_`/`_decoder_` block utilization, and the Grafana dashboard has a GPU row for all of them.
+
+**Encoding** is decided when `--output` builds the sink from a preset: the best hardware encoder present replaces the preset's x264 default, and the `Built sink from preset` log shows which one won. Detection is reliable because the NVIDIA/VA/QSV/AMF/MediaFoundation plugins only register their elements when the device probe succeeds — if `nvh264enc` exists in the registry, there is an NVENC-capable GPU behind it. The preset's parameters map onto each encoder's own vocabulary: bitrate and GOP always, the zero-latency switch per encoder (`realtime`, `low-latency`, `ultra-low-latency` usage), and the VBV burst bound where one is exposed (NVENC `vbv-buffer-size`, VA `cpb-size`).
+
+Two knobs control this, each a CLI flag with an environment-variable twin (the flag wins when both are given):
+
+- `--hw off` (or `BRAIDPIPE_HW=off`) — software everywhere: no decoder promotion, no encoder auto-pick.
+- `--encoder <name>` (or `BRAIDPIPE_ENCODER=<name>`) — pin the encoder regardless of detection; `--encoder auto` explicitly re-enables detection. Hardware encoders trade some quality-per-bit for speed, so the `bandwidth` preset's intent is best served by pinning `x264`. Pinning the encoder leaves GPU *decoding* on — use `--hw off` to force software both ways.
+
+A hand-written `--sink` bypasses encoder selection entirely — you name the encoder yourself.
 
 ## Audio passthrough
 
@@ -281,12 +313,14 @@ If the source has no audio stream, don't pass `--audio` — the audio branch wou
 | `-o, --sink <PIPELINE>` | `videoconvert ! autovideosink` | Output fragment appended after the selector |
 | `--output <URL>` | — | Publish target (`rtmp://`, `srt://`, `udp://host:port`); builds the sink from `--preset` |
 | `--preset <NAME>` | `lowlatency` | Latency/bandwidth profile for `--output`, see [Output presets](#output-presets) |
+| `--hw <auto\|off>` | `auto` | GPU mode, see [GPU acceleration](#gpu-acceleration); `off` forces software decode and encode |
+| `--encoder <NAME>` | `auto` | Encoder for `--output`: `auto` picks the best hardware encoder, or pin `x264`, `vtenc`, `nvenc`, `va`, `vaapi`, `qsv`, `mf`, `amf` |
 | `--audio` | off | Carry source audio to the output muxer, see [Audio passthrough](#audio-passthrough) |
 | `-p, --python-script <PATH>` | `python/braidpipe/worker.py` | Worker to launch |
+| `--external-worker` | off | Don't spawn or supervise a worker; connect to an externally managed AI process, see [External worker mode](#external-worker-mode) |
 | `-f, --fps <N>` | `30` | Frame rate; sets the relay deadline and watchdog tick |
 | `--width <N>` / `--height <N>` | `1280` / `720` | Shared-memory slot geometry |
-| `--shm-name <NAME>` | `/braidpipe_buffer` | POSIX shared memory object name |
-| `--rust-sock <PATH>` | `/tmp/braidpipe_rust.sock` | Where the daemon listens for acks |
+| `--rust-sock <PATH>` | `/tmp/braidpipe_rust.sock` | Where the daemon listens for acks and hellos |
 | `--python-sock <PATH>` | `/tmp/braidpipe_python.sock` | Where the worker listens for notifications |
 | `--passthrough-only` | off | Media path only; no worker, no shared memory |
 | `--metrics-port <N>` | `9184` | Prometheus endpoint on 127.0.0.1, see [Monitoring](#monitoring); `0` disables |
@@ -298,21 +332,23 @@ Set `RUST_LOG=debug` to see per-frame relay activity, including dropped and stal
 
 ## Writing a Python worker
 
-A worker is a loop over one Unix datagram socket. `SharedMemoryManager` gives you a zero-copy NumPy view of the slot, so mutating the array in place *is* writing to the output frame — there's no separate send step for pixels.
+A worker is a loop over one Unix datagram socket. `attach()` runs the handshake — it says hello to the daemon, which answers with the shared-memory segment's file descriptor — and returns a `SharedMemoryManager` giving you a zero-copy NumPy view of each slot, so mutating the array in place *is* writing to the output frame — there's no separate send step for pixels.
 
 ```python
 import json, os, socket
-from shm import SharedMemoryManager
+from shm import attach
 
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
 if os.path.exists("/tmp/braidpipe_python.sock"):
     os.remove("/tmp/braidpipe_python.sock")
 sock.bind("/tmp/braidpipe_python.sock")
 
-shm = SharedMemoryManager()   # reads geometry from the header Rust wrote
+shm = attach(sock, "/tmp/braidpipe_rust.sock")   # handshake; reads geometry from the header
 
 while True:
     packet = json.loads(sock.recvfrom(512)[0])
+    if "frame_id" not in packet:
+        continue   # a control packet, not a frame
     frame = shm.get_slot_numpy_array(packet["slot_index"])   # (H, W, 3) uint8, RGB
 
     # ... your inference here; mutate `frame` in place ...
@@ -336,7 +372,7 @@ Four rules keep the stream healthy:
 3. **Always send an ack, and never die sending it.** Report `"success": false` for a failed frame — the relay treats that as a failure and passes the original through, which is exactly right. Wrap the send in `try/except OSError`; a full datagram buffer (`ENOBUFS`) is normal backpressure, not a fatal condition.
 4. **Frames are RGB, not BGR.** OpenCV's conventions assume BGR, so the familiar `(0, 0, 255)` "red" renders as blue here. Use `(255, 0, 0)` for red, or convert with `cv2.cvtColor` if you're feeding a model trained on BGR.
 
-Point `--python-script` at your own file. Because Python puts the script's own directory on `sys.path`, a worker living beside `shm.py` can `from shm import SharedMemoryManager` directly; from elsewhere, add `python/braidpipe` to `sys.path` or install it as a package.
+Point `--python-script` at your own file. Because Python puts the script's own directory on `sys.path`, a worker living beside `shm.py` can `from shm import attach` directly; from elsewhere, add `python/braidpipe` to `sys.path` or install it as a package.
 
 ### Bundled examples
 
@@ -360,25 +396,37 @@ cargo run -p braidpipe --release -- --python-script python/braidpipe/worker_dete
 
 ### Writing a worker in another language
 
-Nothing in the contract is Python-specific. [crates/braidpipe-ipc/examples/worker.rs](crates/braidpipe-ipc/examples/worker.rs) is a complete worker in Rust — it attaches to the segment, reuses the daemon's own `ShmHeader`/`SlotHeader`/packet types so it cannot drift out of sync with them, transforms pixels, frees the slot, and acks.
+Nothing in the contract is Python-specific. [crates/braidpipe-ipc/examples/worker.rs](crates/braidpipe-ipc/examples/worker.rs) is a complete worker in Rust — it runs the hello handshake, maps the received fd, reuses the daemon's own `ShmHeader`/`SlotHeader`/packet types so it cannot drift out of sync with them, transforms pixels, frees the slot, and acks.
 
-A worker only ever *attaches* to shared memory. Never call `ShmRingBuffer::create` from one: it unlinks and reinitialises the segment out from under the running daemon.
+A worker only ever *attaches* to shared memory, by mapping the fd the daemon hands it. Never call `ShmRingBuffer::create` from one: that makes a second, unrelated segment the daemon will never look at.
 
-The daemon always spawns its `--python-script`, so point that at a no-op and run your own worker alongside it:
+Run the daemon in [external worker mode](#external-worker-mode) and start your own worker alongside it:
 
 ```bash
 # terminal 1 — creates the shared memory segment and streams
-cargo run -p braidpipe --release -- --python-script /dev/null
+cargo run -p braidpipe --release -- --external-worker
 
 # terminal 2 — the AI branch is selected on this worker's first good frame
 cargo run -p braidpipe-ipc --release --example worker
 ```
 
-Any language with POSIX shared memory, Unix datagram sockets, and a JSON parser can do the same. What it must implement is the [IPC contract](#the-ipc-contract) below, in full — the four rules above apply regardless of language.
+Any language that can receive a file descriptor over a Unix datagram socket (`recvmsg` with `SCM_RIGHTS`), `mmap` it, and parse JSON can do the same. What it must implement is the [IPC contract](#the-ipc-contract) below, in full — the four rules above apply regardless of language.
+
+### External worker mode
+
+`--external-worker` is for AI processes the daemon should not own: a Docker container, a systemd service, something started by hand. The daemon skips spawning, supervising, and — importantly — terminating: shutting the daemon down leaves the external process running, because its lifecycle belongs to whoever started it.
+
+Everything else is identical to managed mode. The daemon still creates the shared memory segment and binds its socket; the external process implements the same [IPC contract](#the-ipc-contract) that `worker.py` does (all the bundled workers run unchanged either way). Startup order doesn't matter: until a worker acks, the stream runs on passthrough, and the first good frame selects the AI branch — the same machinery that handles failover recovery. If the external process dies, the stream falls back to passthrough and picks up its replacement whenever one appears.
+
+One metric changes meaning: the daemon can't know whether a process it doesn't own is alive, so in this mode `braidpipe_worker_up` means "delivered a successful AI frame within the last 2 seconds" rather than "my child process is running", and `worker_exits_total` / `worker_last_exit_code` / CPU / RSS are never populated.
+
+For a containerized worker only the socket directory must cross the container boundary — mount it and the fd handshake does the rest, because a file descriptor passed over a Unix socket works across container namespaces with no `/dev/shm` mount or `--ipc=host` required. On macOS, Docker runs inside a VM, so neither sockets nor memory can cross — external mode there means a host process, not a container.
 
 ## The IPC contract
 
-**Shared memory** — one POSIX object holding a 32-byte header followed by `slot_count` slots. Each slot is a 24-byte header plus `width × height × channels` bytes of pixels. All layouts are explicitly padded on the Rust side and mirrored by `struct` format strings in [python/braidpipe/shm.py](python/braidpipe/shm.py), which assert their own sizes at import — a mismatch fails loudly instead of silently reading garbage.
+**Shared memory** — one *anonymous* segment (a `memfd` on Linux, an unlinked POSIX object elsewhere) holding a 32-byte header followed by `slot_count` slots. Each slot is a 24-byte header plus `width × height × channels` bytes of pixels. The segment has no name anywhere: a worker gets in by sending `{"type": "hello"}` to the daemon's socket, and the daemon replies with a datagram (body `{"type": "shm_fd"}`) carrying the segment's file descriptor as `SCM_RIGHTS` ancillary data. The kernel duplicates the descriptor into the worker, which `fstat`s it for the size and `mmap`s it. Because nothing is ever named, nothing can collide between instances, go stale after a crash, or need permission juggling — the kernel frees the segment when the last descriptor and mapping are gone. A worker may say hello before the daemon is up (retry until answered) or at any point after; replies are sent whenever frames are flowing.
+
+All layouts are explicitly padded on the Rust side and mirrored by `struct` format strings in [python/braidpipe/shm.py](python/braidpipe/shm.py), which assert their own sizes at import — a mismatch fails loudly instead of silently reading garbage.
 
 | Structure | Rust | Python format | Size |
 | --- | --- | --- | --- |
@@ -512,6 +560,7 @@ What you get, by the question it answers:
 | Is the stream healthy? | `braidpipe_input_fps`, `braidpipe_pts_discontinuities_total`, `braidpipe_av_skew_seconds`, `braidpipe_keyframes_total`, `braidpipe_bus_messages_total` |
 | What's on the wire? | `braidpipe_sink_bytes_total`, `braidpipe_output_frames_total`, and full `braidpipe_srt_*` transport stats (RTT, loss, retransmits) when the pipeline has an SRT element |
 | Are the processes healthy? | `process_*` for the daemon, `braidpipe_worker_cpu_seconds_total` / `braidpipe_worker_resident_memory_bytes` for the worker, `braidpipe_worker_exits_total` |
+| Is the GPU doing the work? | `braidpipe_gpu_utilization_percent` and `braidpipe_gpu_memory_used_bytes` (machine-wide, sampled every 5s), plus `braidpipe_gpu_encoder_utilization_percent` / `braidpipe_gpu_decoder_utilization_percent` for the dedicated NVENC/NVDEC blocks on NVIDIA. Series exist only where the platform exposes the counter — absent means unmeasurable, not idle |
 
 The A/V skew gauge is the audio-sync claim from [Audio passthrough](#audio-passthrough), continuously verified in production: both streams' running time at the muxer, subtracted.
 
@@ -535,7 +584,7 @@ A metric that stops being scraped keeps its last value on screen, so a daemon th
 
 ## Troubleshooting
 
-**No output at all, or garbled/duplicated frames.** Look for leftover daemons first — this is by far the most common cause. Old instances share the same socket paths, shared-memory name, and output URL, and they will happily fight over all three:
+**No output at all, or garbled/duplicated frames.** Look for leftover daemons first — this is by far the most common cause. Old instances share the same socket paths and output URL, and they will happily fight over both:
 
 ```bash
 pgrep -fl braidpipe
@@ -554,7 +603,7 @@ Raising `GST_DEBUG` to find it is reasonable, but redirect to a file you are wil
 
 **Output goes dark when the AI branch is selected.** Check the log for pipeline errors — the bus watcher surfaces asynchronous failures that would otherwise be silent. Then confirm your sink can accept the AI branch's caps, which are `video/x-raw,format=RGB` at the configured resolution.
 
-**`Failed to set SHM size with ftruncate`.** A stale segment is still mapped by another process. `create()` unlinks before opening, which handles the usual case; if it persists, kill every braidpipe and worker process and try again.
+**Worker hangs at startup without attaching.** The handshake reply is sent from the daemon's ack loop, which runs while frames are flowing — a worker attaches within a frame or two of the first one. If it never does, the daemon isn't receiving frames (check the source), or the two sides disagree on the socket paths.
 
 **Worker exits with `OSError: [Errno 55/105] No buffer space available`.** The ack socket buffer filled up. The bundled worker catches this; a custom worker must too.
 
@@ -590,7 +639,7 @@ cargo fmt --all
 ## Known limitations
 
 - **No worker respawn.** If the Python process dies, the daemon logs it and stays in passthrough for the rest of the run. Restart the worker manually or supervise it externally.
-- **Single video stream.** One source, one sink, one worker per daemon. Run multiple daemons with distinct `--shm-name` and socket paths for multiple streams.
+- **Single video stream.** One source, one sink, one worker per daemon. Run multiple daemons with distinct socket paths for multiple streams — the shared memory is anonymous, so only the sockets need distinct names.
 - **Full-frame RGB only.** The alpha-overlay compositing path — where Python returns just a mask to be blended, instead of a whole frame — is not implemented yet.
 - **Frames are copied, not zero-copy, on the Rust side.** Each frame is copied out of the GStreamer buffer into shared memory and back. Python's view is genuinely zero-copy; Rust's is not.
 - **No hardware-accelerated decode by default.** `decodebin3` picks whatever is available; wire an explicit hardware decoder through `--source` if you need one.
