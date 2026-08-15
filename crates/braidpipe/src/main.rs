@@ -61,6 +61,12 @@ struct Args {
     #[arg(short, long, default_value = "python/braidpipe/worker.py")]
     python_script: PathBuf,
 
+    /// Do not spawn or supervise a worker; an externally managed AI process
+    /// (Docker container, service, hand-started script) connects over the
+    /// same SHM + UDS contract and is picked up on its first good frame
+    #[arg(long, conflicts_with_all = ["python_script", "passthrough_only"])]
+    external_worker: bool,
+
     /// Target stream frame rate (used to calculate 33ms/16ms Watchdog deadlines)
     #[arg(short, long, default_value_t = 30)]
     fps: u32,
@@ -227,23 +233,34 @@ async fn run() -> Result<(), AppError> {
         args.fps,
     );
 
-    // 6. Spawn the Python Worker Subprocess (Supervisor Pattern)
-    // Prefer the project virtualenv so cv2/numpy are importable.
-    let python_exe = if Path::new(".venv/bin/python3").exists() {
-        ".venv/bin/python3"
+    // 6. The AI worker: spawned and supervised here (managed mode), or an
+    // already-running process someone else owns (--external-worker), which
+    // speaks the same SHM + UDS contract and is picked up on its first good
+    // frame. In external mode the daemon must never signal or reap it.
+    let python_child = if args.external_worker {
+        info!("External worker mode: waiting for an AI process to connect over UDS");
+        metrics_server::spawn_external_worker_probe();
+        None
     } else {
-        "python3"
-    };
-    info!(python = python_exe, path = ?args.python_script, "Spawning Python worker subprocess...");
-    let mut python_child = Command::new(python_exe)
-        .arg(&args.python_script)
-        .spawn()
-        .map_err(|e| format!("Failed to execute Python worker: {e}"))?;
+        // Prefer the project virtualenv so cv2/numpy are importable.
+        let python_exe = if Path::new(".venv/bin/python3").exists() {
+            ".venv/bin/python3"
+        } else {
+            "python3"
+        };
+        info!(python = python_exe, path = ?args.python_script, "Spawning Python worker subprocess...");
+        let child = Command::new(python_exe)
+            .arg(&args.python_script)
+            .spawn()
+            .map_err(|e| format!("Failed to execute Python worker: {e}"))?;
 
-    let child_pid = python_child.id().unwrap_or(0);
-    info!(pid = child_pid, "Python worker active");
-    braidpipe_core::metrics::WORKER_UP.set(1);
-    metrics_server::spawn_worker_sampler(child_pid);
+        let pid = child.id().unwrap_or(0);
+        info!(pid, "Python worker active");
+        braidpipe_core::metrics::WORKER_UP.set(1);
+        metrics_server::spawn_worker_sampler(pid);
+        Some(child)
+    };
+    let child_pid = python_child.as_ref().and_then(|c| c.id());
 
     // 7. Expose the Prometheus endpoint, with collectors for the live state
     // the static registry cannot see: pipeline queues / SRT stats, and the
@@ -279,7 +296,9 @@ async fn run() -> Result<(), AppError> {
             return;
         }
         braidpipe_core::metrics::UP.set(0);
-        metrics_server::terminate_worker(child_pid, 2000).await;
+        if let Some(pid) = child_pid {
+            metrics_server::terminate_worker(pid, 2000).await;
+        }
     });
     metrics_server::spawn_shutdown_guard(args.metrics_drain_ms + 4000);
 
@@ -287,27 +306,33 @@ async fn run() -> Result<(), AppError> {
     let mut watchdog = Watchdog::new(engine, ai_bridge, args.fps);
 
     // 10. Spawn a background task to supervise the Python process handle
-    tokio::spawn(async move {
-        match python_child.wait().await {
-            Ok(status) => {
-                warn!(status = %status, "Python worker process exited");
-                braidpipe_core::metrics::WORKER_UP.set(0);
-                braidpipe_core::metrics::WORKER_EXITS.inc();
-                braidpipe_core::metrics::WORKER_LAST_EXIT_CODE
-                    .set(i64::from(status.code().unwrap_or(-1)));
+    // (managed mode only -- an external worker's exits are not ours to see)
+    if let Some(mut python_child) = python_child {
+        tokio::spawn(async move {
+            match python_child.wait().await {
+                Ok(status) => {
+                    warn!(status = %status, "Python worker process exited");
+                    braidpipe_core::metrics::WORKER_UP.set(0);
+                    braidpipe_core::metrics::WORKER_EXITS.inc();
+                    braidpipe_core::metrics::WORKER_LAST_EXIT_CODE
+                        .set(i64::from(status.code().unwrap_or(-1)));
+                }
+                Err(e) => error!(error = %e, "Error waiting on Python process handle"),
             }
-            Err(e) => error!(error = %e, "Error waiting on Python process handle"),
-        }
-    });
+        });
+    }
 
     // 11. Hand execution to the Watchdog event loop (Blocks until SIGINT/SIGTERM)
     info!("System initialized. Handing off execution to Watchdog FSM...");
     watchdog.run_loop().await;
 
     // 12. Graceful shutdown. Ctrl+C reaches the worker too when both share a
-    // terminal, but not when the daemon is supervised, so stop it explicitly;
+    // terminal, but not when the daemon is supervised, so stop it explicitly
+    // (never in external mode -- that process has its own supervisor);
     // then hold the endpoint open until the down state has been scraped.
-    metrics_server::terminate_worker(child_pid, 2000).await;
+    if let Some(pid) = child_pid {
+        metrics_server::terminate_worker(pid, 2000).await;
+    }
     metrics_server::drain(args.metrics_port, args.metrics_drain_ms).await;
 
     Ok(())

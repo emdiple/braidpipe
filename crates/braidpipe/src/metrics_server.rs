@@ -162,6 +162,22 @@ pub fn spawn_worker_sampler(pid: u32) {
     });
 }
 
+/// External worker mode: `worker_up` cannot mean "my child is alive" for a
+/// process the daemon does not own, so it means "delivered a successful AI
+/// frame within the last 2 seconds" instead, derived from the timestamp the
+/// relay already records on every good roundtrip.
+pub fn spawn_external_worker_probe() {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            ticker.tick().await;
+            let last = metrics::LAST_AI_FRAME_TIMESTAMP.get();
+            let up = last > 0.0 && metrics::unix_now() - last < 2.0;
+            metrics::WORKER_UP.set(i64::from(up));
+        }
+    });
+}
+
 /// Marks the daemon down and keeps serving long enough for Prometheus to
 /// scrape that final state.
 ///

@@ -258,7 +258,7 @@ pub fn render(out: &mut String) {
     let _ = writeln!(out, "braidpipe_branch_seconds_total{{branch=\"ai\"}} {}", BRANCH_SECONDS_AI.seconds());
     let _ = writeln!(out, "braidpipe_branch_seconds_total{{branch=\"passthrough\"}} {}", BRANCH_SECONDS_PASSTHROUGH.seconds());
 
-    gauge!("braidpipe_worker_up", "1 while the Python worker process is running", WORKER_UP.get());
+    gauge!("braidpipe_worker_up", "1 while the worker is running (managed) or recently delivering frames (external)", WORKER_UP.get());
     counter!("braidpipe_worker_exits_total", "Times the worker process has exited", "" => WORKER_EXITS);
     gauge!("braidpipe_worker_last_exit_code", "Exit code of the most recent worker exit", WORKER_LAST_EXIT_CODE.get());
     gauge!("braidpipe_worker_cpu_seconds_total", "Cumulative CPU time of the worker process", WORKER_CPU_SECONDS.get());
