@@ -26,7 +26,7 @@ import os
 import socket
 import time
 
-from shm import SharedMemoryManager
+from shm import attach
 from stamp import encode
 
 RUST_SOCK = os.environ.get("BRAIDPIPE_RUST_SOCK", "/tmp/braidpipe_rust.sock")
@@ -63,10 +63,11 @@ def run_worker(rust_sock_path: str, python_sock_path: str) -> None:
     if os.path.exists(python_sock_path):
         os.remove(python_sock_path)
 
-    shm = SharedMemoryManager()
-
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     sock.bind(python_sock_path)
+
+    # Handshake: the daemon answers our hello with the shared-memory fd.
+    shm = attach(sock, rust_sock_path)
     print(
         f"[stamp] attached to SHM ({shm.width}x{shm.height} @ {shm.channels}ch), "
         f"busy={BUSY_MS}ms",
@@ -78,6 +79,8 @@ def run_worker(rust_sock_path: str, python_sock_path: str) -> None:
     try:
         while True:
             packet = json.loads(sock.recvfrom(512)[0])
+            if "frame_id" not in packet:
+                continue  # a control packet, e.g. a duplicate handshake reply
             frame_id = packet["frame_id"]
             slot_idx = packet["slot_index"]
             started = time.perf_counter_ns()
