@@ -8,6 +8,7 @@ use braidpipe_engine::pipeline::GStreamerEngine;
 use braidpipe_ipc::shm::ShmRingBuffer;
 use braidpipe_ipc::uds::UdsControlBridge;
 use clap::Parser;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
@@ -86,6 +87,13 @@ struct Args {
     /// Socket path for Python UDS listener
     #[arg(long, default_value = "/tmp/braidpipe_python.sock")]
     python_sock: String,
+
+    /// Also listen for workers on other machines at this address (e.g.
+    /// 0.0.0.0:7300): UDP for the hello/config negotiation and TCP on the
+    /// same port for raw frame exchange. Needs the bandwidth of a fast LAN;
+    /// see the README's cross-machine section
+    #[arg(long, value_name = "IP:PORT")]
+    worker_listen: Option<SocketAddr>,
 
     /// Keep the stream on the passthrough branch without starting the Python worker
     #[arg(long)]
@@ -223,6 +231,12 @@ async fn run() -> Result<(), AppError> {
         UdsControlBridge::bind(&args.rust_sock, &args.python_sock, Arc::clone(&shm_buffer))
             .await?,
     );
+
+    // Optionally open the same negotiation to workers on other machines
+    // (tcp-raw transport). Local shm workers keep working alongside it.
+    if let Some(listen) = args.worker_listen {
+        ai_bridge.enable_remote(listen, args.fps).await?;
+    }
 
     // 5. Attach the frame relay: appsink -> SHM -> Python -> appsrc
     relay::spawn(

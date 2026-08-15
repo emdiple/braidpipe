@@ -1,23 +1,27 @@
+use crate::net::RemoteState;
 use crate::shm::ShmRingBuffer;
 use braidpipe_core::ports::ai::{AiBridge, FrameMetadata, IpcError};
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UnixDatagram;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 /// Consecutive frame-roundtrip failures before the worker is declared unhealthy
 const MAX_FAILURE_STREAK: u32 = 30;
 
-/// What a worker sends to announce itself, and what the daemon's shared-memory
-/// fd reply says. The reply datagram carries the fd itself as SCM_RIGHTS
-/// ancillary data; the JSON body only labels it.
+/// What a worker sends to announce itself. It may also carry a `transports`
+/// list (`["shm", "tcp-raw"]`); absent means shm, which is all a Unix-socket
+/// hello can be answered with anyway. The daemon's reply is a `config` packet
+/// describing the chosen transport -- over UDS it carries the segment fd as
+/// SCM_RIGHTS ancillary data, over UDP it carries the TCP data port instead.
 pub const WORKER_HELLO: &[u8] = b"{\"type\":\"hello\"}";
-pub const SHM_FD_REPLY: &[u8] = b"{\"type\":\"shm_fd\"}";
 
 /// Control packet sent from Rust -> Python
 #[derive(Debug, Serialize, Deserialize)]
@@ -47,6 +51,13 @@ pub struct UdsControlBridge {
     /// Held so the segment fd stays valid for every hello this bridge answers.
     shm: Arc<ShmRingBuffer>,
     failure_streak: AtomicU32,
+    /// The config packet answering a UDS hello (the fd rides alongside it).
+    shm_config: String,
+    /// The tcp-raw transport for workers on other machines. Inert until
+    /// [`enable_remote`] binds its listeners.
+    remote: Arc<RemoteState>,
+    /// Acks arriving over tcp-raw, merged into `await_processed_frame`.
+    remote_acks: tokio::sync::Mutex<mpsc::Receiver<FrameProcessedPacket>>,
 }
 
 impl UdsControlBridge {
@@ -72,24 +83,52 @@ impl UdsControlBridge {
             "UDS Control Bridge initialized"
         );
 
+        let header = shm.header();
+        let shm_config = format!(
+            concat!(
+                "{{\"type\":\"config\",\"transport\":\"shm\",\"width\":{},\"height\":{},",
+                "\"channels\":{},\"slots\":{},\"format\":\"rgb\"}}"
+            ),
+            header.width, header.height, header.channels, header.slot_count
+        );
+
+        // Sized for a few stale acks beyond the one in flight; the reader
+        // task blocks (and eventually detaches) rather than piling up more.
+        let (ack_tx, ack_rx) = mpsc::channel(8);
+
         Ok(Self {
             socket,
             python_sock_path: python_path,
-            shm,
+            shm: Arc::clone(&shm),
             // Start unhealthy: the AI branch must prove itself with one
             // successful frame roundtrip before the Watchdog may select it.
             failure_streak: AtomicU32::new(MAX_FAILURE_STREAK),
+            shm_config,
+            remote: Arc::new(RemoteState::new(shm, ack_tx)),
+            remote_acks: tokio::sync::Mutex::new(ack_rx),
         })
     }
 
-    /// Answers a worker's hello: a datagram whose ancillary data duplicates
-    /// the segment fd into the worker. The worker fstats it for the size, so
-    /// no geometry needs to travel in the body.
+    /// Starts listening for remote workers on `listen`: UDP for the
+    /// hello/config negotiation, TCP on the same port for the raw frame
+    /// exchange. Returns the bound (control, data) addresses.
+    pub async fn enable_remote(
+        &self,
+        listen: SocketAddr,
+        fps: u32,
+    ) -> Result<(SocketAddr, SocketAddr), IpcError> {
+        self.remote.enable(listen, fps).await
+    }
+
+    /// Answers a worker's hello: the shm config packet, with ancillary data
+    /// duplicating the segment fd into the worker. The worker fstats the fd
+    /// for the size and reads the ring geometry from the segment header, so
+    /// the body is informative rather than load-bearing.
     fn send_shm_fd(&self) {
         match send_fd_to(
             self.socket.as_raw_fd(),
             &self.python_sock_path,
-            SHM_FD_REPLY,
+            self.shm_config.as_bytes(),
             self.shm.fd(),
         ) {
             Ok(()) => info!("Worker said hello; passed it the shared-memory fd"),
@@ -110,8 +149,29 @@ impl UdsControlBridge {
     }
 }
 
+/// Turns a worker's ack into the relay-facing result, whichever transport
+/// carried it. The ack's processing time rides in the metadata's timestamp.
+fn ack_to_metadata(packet: FrameProcessedPacket) -> Result<FrameMetadata, IpcError> {
+    if !packet.success {
+        return Err(IpcError::SocketError(
+            "Worker reported inference failure".into(),
+        ));
+    }
+    Ok(FrameMetadata {
+        frame_id: packet.frame_id,
+        slot_index: packet.slot_index,
+        timestamp_us: packet.processing_time_us,
+    })
+}
+
 impl AiBridge for UdsControlBridge {
     async fn notify_frame_ready(&self, meta: FrameMetadata) -> Result<(), IpcError> {
+        // A remote worker takes the whole frame with the notification; a
+        // local one is only told which slot to look at.
+        if self.remote.attached() {
+            return self.remote.send_frame(meta).await;
+        }
+
         let packet = FrameReadyPacket {
             frame_id: meta.frame_id,
             slot_index: meta.slot_index,
@@ -142,19 +202,35 @@ impl AiBridge for UdsControlBridge {
     ) -> Result<FrameMetadata, IpcError> {
         let mut buf = [0u8; 512];
         let started = Instant::now();
+        let mut remote_acks = self.remote_acks.lock().await;
 
-        // The same socket carries acks and worker hellos, so this loops:
-        // a hello is answered with the segment fd and the wait continues on
-        // whatever deadline budget is left.
+        enum Event {
+            Datagram(usize),
+            RemoteAck(FrameProcessedPacket),
+        }
+
+        // The UDS socket carries acks and worker hellos, and tcp-raw acks
+        // arrive on their own channel, so this loops: a hello is answered
+        // with the segment fd and the wait continues on whatever deadline
+        // budget is left.
         loop {
             let remaining = frame_deadline
                 .checked_sub(started.elapsed())
                 .ok_or(IpcError::DeadlineMissed)?;
 
-            let read_result = timeout(remaining, self.socket.recv(&mut buf)).await;
+            let event = timeout(remaining, async {
+                tokio::select! {
+                    read = self.socket.recv(&mut buf) => read.map(Event::Datagram),
+                    ack = remote_acks.recv() => {
+                        // The bridge owns a sender for as long as it lives.
+                        Ok(Event::RemoteAck(ack.expect("remote ack channel closed")))
+                    }
+                }
+            })
+            .await;
 
-            match read_result {
-                Ok(Ok(bytes_read)) => {
+            match event {
+                Ok(Ok(Event::Datagram(bytes_read))) => {
                     let data = &buf[..bytes_read];
 
                     if let Ok(control) = serde_json::from_slice::<ControlPacket>(data) {
@@ -168,23 +244,13 @@ impl AiBridge for UdsControlBridge {
 
                     let packet: FrameProcessedPacket = serde_json::from_slice(data)
                         .map_err(|e| IpcError::SocketError(format!("Invalid ACK JSON: {e}")))?;
-
-                    if !packet.success {
-                        return Err(IpcError::SocketError(
-                            "Python reported inference failure".into(),
-                        ));
-                    }
-
-                    return Ok(FrameMetadata {
-                        frame_id: packet.frame_id,
-                        slot_index: packet.slot_index,
-                        timestamp_us: packet.processing_time_us,
-                    });
+                    return ack_to_metadata(packet);
                 }
+                Ok(Ok(Event::RemoteAck(packet))) => return ack_to_metadata(packet),
                 Ok(Err(e)) => return Err(IpcError::SocketError(format!("UDS recv error: {e}"))),
                 Err(_) => {
                     // Deadline missed! The Watchdog will catch this and trigger Passthrough Mode
-                    warn!("Python failed to respond within target deadline!");
+                    warn!("Worker failed to respond within target deadline!");
                     return Err(IpcError::DeadlineMissed);
                 }
             }
@@ -192,10 +258,12 @@ impl AiBridge for UdsControlBridge {
     }
 
     async fn is_healthy(&self) -> bool {
-        // The worker must both be listening on its socket AND keeping up with
-        // the frame deadlines (a stale socket file survives a SIGKILL).
-        let healthy = self.python_sock_path.exists()
-            && self.failure_streak.load(Ordering::Relaxed) < MAX_FAILURE_STREAK;
+        // The worker must be reachable -- a local socket file or a live
+        // tcp-raw connection -- AND keeping up with the frame deadlines
+        // (a stale socket file survives a SIGKILL).
+        let reachable = self.python_sock_path.exists() || self.remote.attached();
+        let healthy =
+            reachable && self.failure_streak.load(Ordering::Relaxed) < MAX_FAILURE_STREAK;
         braidpipe_core::metrics::WORKER_HEALTHY.set(i64::from(healthy));
         healthy
     }
@@ -306,12 +374,13 @@ mod tests {
         let receiver = StdUnixDatagram::bind(&receiver_path).unwrap();
 
         // Pass the fd of a real shared segment, as the daemon does.
+        let payload = b"{\"type\":\"config\",\"transport\":\"shm\"}";
         let shm = ShmRingBuffer::create(4, 2, 3, 2).unwrap();
-        send_fd_to(sender.as_raw_fd(), &receiver_path, SHM_FD_REPLY, shm.fd()).unwrap();
+        send_fd_to(sender.as_raw_fd(), &receiver_path, payload, shm.fd()).unwrap();
 
         let mut buf = [0u8; 128];
         let (bytes, fd) = recv_fd(&receiver, &mut buf);
-        assert_eq!(&buf[..bytes], SHM_FD_REPLY);
+        assert_eq!(&buf[..bytes], payload);
         assert_ne!(fd, shm.fd(), "kernel must hand over a duplicate, not the same number");
 
         // The duplicate describes the same segment: fstat sees its size.

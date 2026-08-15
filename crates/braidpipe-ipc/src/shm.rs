@@ -168,6 +168,12 @@ impl ShmRingBuffer {
         self.fd
     }
 
+    /// The segment header, for describing the ring's geometry to a worker
+    /// during connection negotiation.
+    pub fn header(&self) -> &ShmHeader {
+        self.header
+    }
+
     /// Reclaims a slot whose notification or ack failed, so a worker that
     /// never learned about the frame cannot leak the slot forever. Only flips
     /// READY_FOR_AI back to FREE; a slot Python already freed is left alone.
@@ -239,6 +245,38 @@ impl ShmRingBuffer {
         unsafe {
             let pixel_buffer_ptr = self.mmap_ptr.add(slot_offset + slot_header_size);
             ptr::copy_nonoverlapping(pixel_buffer_ptr, out.as_mut_ptr(), out.len());
+        }
+
+        Ok(())
+    }
+
+    /// Writes processed pixels back into a slot and frees it -- the daemon-side
+    /// equivalent of what a local worker does through its own mapping. The
+    /// tcp-raw transport uses this to land a remote worker's result before the
+    /// relay reads the slot.
+    pub fn store_processed(&self, slot_index: u8, data: &[u8]) -> Result<(), IpcError> {
+        if slot_index >= self.header.slot_count {
+            return Err(IpcError::ShmError(format!(
+                "Slot index {slot_index} out of range"
+            )));
+        }
+        if data.len() != self.frame_size() {
+            return Err(IpcError::ShmError(format!(
+                "Processed payload size ({}) does not match slot payload size ({})",
+                data.len(),
+                self.frame_size()
+            )));
+        }
+
+        let header_size = std::mem::size_of::<ShmHeader>();
+        let slot_header_size = std::mem::size_of::<SlotHeader>();
+        let slot_offset = header_size + (slot_index as usize * self.header.slot_size as usize);
+
+        unsafe {
+            let pixel_buffer_ptr = self.mmap_ptr.add(slot_offset + slot_header_size);
+            ptr::copy_nonoverlapping(data.as_ptr(), pixel_buffer_ptr, data.len());
+            let slot_header = &*(self.mmap_ptr.add(slot_offset) as *const SlotHeader);
+            slot_header.state.store(SLOT_FREE, Ordering::Release);
         }
 
         Ok(())
