@@ -9,7 +9,12 @@ screen.
 Usage:
     cargo run -p braidpipe --release -- --python-script python/braidpipe/worker_edges.py
 
+    # or from another machine, against a daemon started with --worker-listen:
+    BRAIDPIPE_DAEMON=192.168.1.10:7300 python3 worker_edges.py
+
 Environment:
+    BRAIDPIPE_DAEMON        daemon's --worker-listen address; switches this
+                            worker to the tcp-raw transport   (default: unset)
     BRAIDPIPE_EDGE_LOW      lower Canny threshold     (default: 80)
     BRAIDPIPE_EDGE_HIGH     upper Canny threshold     (default: 180)
     BRAIDPIPE_RUST_SOCK     daemon's ack socket       (default: /tmp/braidpipe_rust.sock)
@@ -23,8 +28,10 @@ import time
 
 import cv2
 import numpy as np
+from remote import connect as remote_connect
 from shm import attach
 
+DAEMON = os.environ.get("BRAIDPIPE_DAEMON")
 RUST_SOCK = os.environ.get("BRAIDPIPE_RUST_SOCK", "/tmp/braidpipe_rust.sock")
 PYTHON_SOCK = os.environ.get("BRAIDPIPE_PYTHON_SOCK", "/tmp/braidpipe_python.sock")
 EDGE_LOW = int(os.environ.get("BRAIDPIPE_EDGE_LOW", "80"))
@@ -109,5 +116,41 @@ def run_worker(rust_sock_path: str, python_sock_path: str) -> None:
             os.remove(python_sock_path)
 
 
+def run_remote(daemon: str) -> None:
+    """The same worker over tcp-raw: frames arrive on a TCP connection instead
+    of a shared-memory slot, and sending the result back doubles as the ack."""
+    link = remote_connect(daemon)
+    print(
+        f"[edges] connected to daemon at {daemon} "
+        f"({link.width}x{link.height} @ {link.channels}ch), "
+        f"thresholds={EDGE_LOW}/{EDGE_HIGH}",
+        flush=True,
+    )
+    try:
+        for frame_id, slot_idx, _timestamp_us, frame in link.frames():
+            started = time.perf_counter_ns()
+            success = True
+            try:
+                apply_edges(frame)
+            except Exception as exc:
+                success = False
+                print(f"[edges] frame {frame_id} failed: {exc}", flush=True)
+            link.send_processed(
+                frame_id,
+                slot_idx,
+                frame,
+                (time.perf_counter_ns() - started) // 1000,
+                success,
+            )
+        print("[edges] daemon hung up", flush=True)
+    except KeyboardInterrupt:
+        print("[edges] shutting down cleanly...", flush=True)
+    finally:
+        link.close()
+
+
 if __name__ == "__main__":
-    run_worker(RUST_SOCK, PYTHON_SOCK)
+    if DAEMON:
+        run_remote(DAEMON)
+    else:
+        run_worker(RUST_SOCK, PYTHON_SOCK)
