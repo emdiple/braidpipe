@@ -1,0 +1,11 @@
+target/
+.venv/
+.git/
+.local/
+**/__pycache__/
+monitoring/
+assets/
+docs/
+scripts/
+yolov8n.pt
+*.md

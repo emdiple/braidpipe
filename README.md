@@ -108,6 +108,17 @@ cargo run -p braidpipe --release -- --python-script python/braidpipe/worker_edge
 kill -9 <pid from the "Python worker active pid=…" log line>
 ```
 
+## Docker
+
+The repo ships a compose stack that runs the daemon and a worker as separate containers, sharing only a socket volume — the shared memory itself is anonymous, so its fd crosses the container boundary inside the daemon's socket reply, with no `/dev/shm` mount and no `ipc: host`:
+
+```bash
+docker compose up --build
+ffplay udp://127.0.0.1:9720   # the edge-transformed test pattern
+```
+
+`restart: unless-stopped` on the worker service is what closes the daemon's deliberate no-respawn gap: a crashed worker container is restarted by Docker, says hello again, and the stream returns from passthrough to the AI branch — measured at ~365 ms of passthrough for a hard worker crash. Swap the worker or the input/output by editing `command:` in [docker-compose.yml](docker-compose.yml); `docker compose --profile metrics up` additionally bridges the Prometheus endpoint to `http://127.0.0.1:9185/metrics`.
+
 ## A real stream
 
 Ingest SRT, publish RTMP, with the encoder built from a latency/bandwidth profile:
