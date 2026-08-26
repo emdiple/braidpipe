@@ -1,0 +1,71 @@
+# braidpipe + an external Python worker, talking over a shared socket volume.
+#
+#   docker compose up --build
+#   ffplay udp://127.0.0.1:9720                    # watch the output
+#
+# The shared-memory segment is anonymous: its fd crosses the container
+# boundary inside the daemon's UDS reply, so only the socket directory needs
+# to be shared -- no /dev/shm mount, no ipc: host.
+#
+# The daemon never respawns a dead worker by design; `restart: unless-stopped`
+# on the worker service is what closes that loop here. The stream itself never
+# depends on the worker: while the worker is down the daemon emits passthrough.
+#
+# Metrics are served on 127.0.0.1 inside the daemon's netns; opt in to the
+# socat bridge with:  docker compose --profile metrics up
+#   curl http://127.0.0.1:9185/metrics
+
+services:
+  braidpipe:
+    build: .
+    image: braidpipe
+    command:
+      - --external-worker
+      - --rust-sock=/sockets/rust.sock
+      - --python-sock=/sockets/python.sock
+      - --preset=lowlatency
+      # MPEG-TS over UDP to the host; watch it with `ffplay udp://127.0.0.1:9720`.
+      # Chosen as the default because it never blocks: an srt:// listener
+      # output stalls the entire pipeline until the first viewer connects.
+      - --output=udp://host.docker.internal:9720
+      # Real-world alternatives:
+      # - --output=rtmp://my-server/live/stream
+      # - --output=srt://0.0.0.0:9710?mode=listener   (publish 9710/udp; the
+      #   pipeline waits for a viewer before frames start moving)
+      # No --uri: the default test pattern. For a real ingest, e.g.:
+      # - --uri=srt://0.0.0.0:9000?mode=listener   (and publish 9000/udp)
+    extra_hosts:
+      - host.docker.internal:host-gateway   # so the Linux engine resolves it too
+    volumes:
+      - sockets:/sockets
+    ports:
+      - "9185:9185"       # metrics, only live with --profile metrics
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    image: braidpipe-worker
+    # command: ["worker_stamp.py"]   # or any other bundled/own worker
+    environment:
+      BRAIDPIPE_RUST_SOCK: /sockets/rust.sock
+      BRAIDPIPE_PYTHON_SOCK: /sockets/python.sock
+    volumes:
+      - sockets:/sockets
+    restart: unless-stopped
+
+  # The daemon binds its Prometheus endpoint to 127.0.0.1 only, which inside a
+  # container is unreachable from anywhere else. This sidecar joins the
+  # daemon's network namespace and forwards 0.0.0.0:9185 -> 127.0.0.1:9184.
+  metrics:
+    profiles: [metrics]
+    image: alpine/socat
+    network_mode: service:braidpipe
+    command: TCP-LISTEN:9185,fork,reuseaddr TCP:127.0.0.1:9184
+    depends_on:
+      - braidpipe
+    restart: unless-stopped
+
+volumes:
+  sockets:

@@ -97,6 +97,8 @@ Any language that can receive a file descriptor over a Unix datagram socket (`re
 
 `--external-worker` is for AI processes the daemon should not own: a Docker container, a systemd service, something started by hand. The daemon skips spawning, supervising, and — importantly — terminating: shutting the daemon down leaves the external process running, because its lifecycle belongs to whoever started it.
 
+The repository root's [docker-compose.yml](../docker-compose.yml) is a working example of exactly this arrangement: daemon and worker in separate containers, sharing only the directory holding the two sockets — the shared-memory fd crosses the container boundary inside the daemon's socket reply, so no `/dev/shm` mount or `ipc: host` is needed, and Docker's `restart: unless-stopped` supplies the worker respawn the daemon deliberately omits.
+
 Everything else is identical to managed mode. The daemon still creates the shared memory segment and binds its socket; the external process implements the same [IPC contract](#the-ipc-contract) that `worker.py` does (all the bundled workers run unchanged either way). Startup order doesn't matter: until a worker acks, the stream runs on passthrough, and the first good frame selects the AI branch — the same machinery that handles failover recovery. If the external process dies, the stream falls back to passthrough and picks up its replacement whenever one appears.
 
 A full example — a live SRT relay with audio, joined later by the YOLO worker started by hand:
