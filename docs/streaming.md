@@ -6,6 +6,7 @@ Everything between the input URI and the output URL: real sources and sinks, the
 
 - [Real-world pipelines](#real-world-pipelines)
 - [Output presets](#output-presets)
+  - [Recipe: NDI 1080p50, low latency, high quality](#recipe-ndi-1080p50-low-latency-high-quality)
   - [Measured bandwidth](#measured-bandwidth)
 - [GPU acceleration](#gpu-acceleration)
 - [Audio passthrough](#audio-passthrough)
@@ -109,6 +110,28 @@ BRAIDPIPE_BITRATE_KBPS=2500 cargo run -p braidpipe --release -- \
 ```
 
 Verified end-to-end with the [latency harness](operations.md#measuring-latency): `--preset lowlatency --output rtmp://…` measured 39.8 ms p50 / 45.6 ms p99 worker→receiver at 720p30, identical to the hand-tuned sink.
+
+### Recipe: NDI 1080p50, low latency, high quality
+
+When bandwidth is not a constraint and the goal is the lowest latency at the best picture, start from `lowlatency` and turn exactly two knobs:
+
+```bash
+BRAIDPIPE_BITRATE_KBPS=20000 BRAIDPIPE_SPEED_PRESET=fast \
+cargo run -p braidpipe --release -- \
+  --uri 'ndi://Studio%20Camera' \
+  --width 1920 --height 1080 --fps 50 \
+  --preset lowlatency --encoder auto \
+  --output rtmp://localhost/live/stream
+```
+
+Why these values and nothing else:
+
+- **`--preset lowlatency`** already pulls every latency lever that matters — `tune=zerolatency` (no B-frames, no lookahead), a 200 ms VBV burst bound, `sync=false` on the sink, a 2 s GOP (`key-int-max=100` at 50 fps). None of those need restating.
+- **`BRAIDPIPE_BITRATE_KBPS=20000`** — the preset's 4500 kbps assumes 720p30; 1080p50 is ~3.7× the pixel rate, and for H.264 at this format quality saturates around 20–25 Mbps. Past that you are spending bits without seeing them.
+- **`BRAIDPIPE_SPEED_PRESET=fast`** — the speed preset costs CPU, not latency, as long as the encoder keeps real time. `fast` buys compression efficiency over the preset's `veryfast`; go slower only if CPU headroom says so, and never shrink the VBV to compensate.
+- **`--encoder auto`** — at 20 Mbps the quality gap between hardware encoders and x264 collapses, so let a GPU take the job and keep the CPU for the worker (which has a 20 ms/frame budget at 50 fps).
+
+Do **not** reach for the `bandwidth` preset here: its lookahead and B-frames add several frames of encoder delay by design.
 
 ### Measured bandwidth
 
