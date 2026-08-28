@@ -33,6 +33,17 @@ cargo run -p braidpipe --release -- \
 cargo run -p braidpipe --release -- --uri 'ndi://Studio%20Camera' --sink 'videoconvert ! autovideosink'
 ```
 
+**A Blackmagic DeckLink capture card** (SDI/HDMI), via the `decklink://` pseudo-scheme:
+
+```bash
+cargo run -p braidpipe --release -- \
+  --uri 'decklink://0?mode=1080p50&connection=sdi' \
+  --width 1920 --height 1080 --fps 50 \
+  --preset lowlatency --output rtmp://localhost/live/stream
+```
+
+`decklinkvideosrc` registers no GStreamer URI handler, so the daemon maps this scheme itself: the number after `//` is the card (`decklink://` alone means the first one), and the optional `mode` and `connection` query parameters go straight to the element — `gst-inspect-1.0 decklinkvideosrc` lists the valid values, and `mode=auto` follows whatever the deck delivers on cards that support format detection. Needs the `decklink` plugin from gst-plugins-bad and Blackmagic's Desktop Video drivers installed. `--audio` works here too: a capture card has no demuxer to tap, so the audio branch is sourced from `decklinkaudiosrc` on the same device number, picking up the embedded SDI/HDMI audio.
+
 **Raw RTP in**, which needs explicit caps and a depayloader — that's what `--source` is for:
 
 ```bash
@@ -212,7 +223,7 @@ If the source has no audio stream, don't pass `--audio` — the audio branch wou
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `-i, --source <PIPELINE>` | test pattern | Explicit GStreamer source fragment |
-| `--uri <URI>` | — | Input URI decoded by GStreamer (`srt://`, `udp://`, `rtp://`, `ndi://`, `file://`) |
+| `--uri <URI>` | — | Input URI decoded by GStreamer (`srt://`, `udp://`, `rtp://`, `ndi://`, `file://`), or a DeckLink capture card (`decklink://<device>?mode=…&connection=…`) |
 | `-o, --sink <PIPELINE>` | `videoconvert ! autovideosink` | Output fragment appended after the selector |
 | `--output <URL>` | — | Publish target (`rtmp://`, `srt://`, `udp://host:port`); builds the sink from `--preset` |
 | `--preset <NAME>` | `lowlatency` | Latency/bandwidth profile for `--output`, see [Output presets](#output-presets) |

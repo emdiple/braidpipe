@@ -356,11 +356,14 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
 /// plain queues here just have to be deep enough to hold audio while the video
 /// leg spends its AI budget and encoder delay, and the defaults (1 s) dwarf
 /// both.
-pub fn audio_branch() -> Result<String, String> {
-    build_audio_branch(|key| std::env::var(key).ok())
+pub fn audio_branch(tap: Option<&str>) -> Result<String, String> {
+    build_audio_branch(tap, |key| std::env::var(key).ok())
 }
 
-fn build_audio_branch(env: impl Fn(&str) -> Option<String>) -> Result<String, String> {
+fn build_audio_branch(
+    tap: Option<&str>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<String, String> {
     if let Some(branch) = env("BRAIDPIPE_AUDIO_BRANCH") {
         return Ok(branch);
     }
@@ -371,9 +374,14 @@ fn build_audio_branch(env: impl Fn(&str) -> Option<String>) -> Result<String, St
         None => 128,
     };
 
+    // The tap is where audio comes from: the named decodebin of a --uri
+    // source by default, or a capture-card audio element (decklinkaudiosrc)
+    // when the source has no demuxer to tap.
+    let tap = tap.unwrap_or("decoder. ! queue ! audio/x-raw");
+
     // The common AAC encoders (avenc_aac, fdkaacenc, faac) all take bps.
     Ok(format!(
-        "decoder. ! queue ! audio/x-raw ! audioconvert ! audioresample ! \
+        "{tap} ! audioconvert ! audioresample ! \
          {encoder} bitrate={} ! aacparse ! queue ! mux.",
         bitrate_kbps * 1000
     ))
@@ -462,15 +470,23 @@ mod tests {
 
     #[test]
     fn audio_branch_links_decoder_to_mux() {
-        let branch = build_audio_branch(no_env).unwrap();
+        let branch = build_audio_branch(None, no_env).unwrap();
         assert!(branch.starts_with("decoder. ! "));
         assert!(branch.ends_with(" ! mux."));
         assert!(branch.contains("avenc_aac bitrate=128000"));
     }
 
     #[test]
+    fn audio_branch_tap_override_replaces_the_decoder() {
+        let branch =
+            build_audio_branch(Some("decklinkaudiosrc device-number=0 ! queue"), no_env).unwrap();
+        assert!(branch.starts_with("decklinkaudiosrc device-number=0 ! queue ! audioconvert"));
+        assert!(branch.ends_with(" ! mux."));
+    }
+
+    #[test]
     fn audio_branch_env_overrides() {
-        let branch = build_audio_branch(|key| match key {
+        let branch = build_audio_branch(None, |key| match key {
             "BRAIDPIPE_AUDIO_ENCODER" => Some("fdkaacenc".into()),
             "BRAIDPIPE_AUDIO_BITRATE_KBPS" => Some("96".into()),
             _ => None,
@@ -478,7 +494,7 @@ mod tests {
         .unwrap();
         assert!(branch.contains("fdkaacenc bitrate=96000"));
 
-        let replaced = build_audio_branch(|key| {
+        let replaced = build_audio_branch(None, |key| {
             (key == "BRAIDPIPE_AUDIO_BRANCH").then(|| "decoder. ! fakesink".to_string())
         })
         .unwrap();
