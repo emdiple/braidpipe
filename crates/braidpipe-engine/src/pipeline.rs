@@ -408,7 +408,7 @@ impl GStreamerEngine {
     fn uri_source_pipeline(uri: &str) -> Result<String, EngineError> {
         if uri.trim().is_empty() || !uri.contains("://") {
             return Err(EngineError::BuildFailed(
-                "Input URI must include a scheme, such as srt://, udp://, rtp://, or ndi://".into(),
+                "Input URI must include a scheme, such as srt://, udp://, rtp://, ndi://, or decklink://".into(),
             ));
         }
 
@@ -416,6 +416,10 @@ impl GStreamerEngine {
             return Err(EngineError::BuildFailed(
                 "Input URI cannot contain quotes or backslashes".into(),
             ));
+        }
+
+        if let Some(decklink) = DecklinkInput::parse(uri) {
+            return Ok(decklink?.video_source());
         }
 
         if uri
@@ -447,6 +451,82 @@ impl GStreamerEngine {
             .ok_or_else(|| EngineError::BuildFailed("Missing ai_src".into()))?
             .downcast::<AppSrc>()
             .map_err(|_| EngineError::BuildFailed("Invalid AppSrc".into()))
+    }
+}
+
+/// The `decklink://` pseudo-scheme for Blackmagic capture cards:
+/// `decklink://<device-number>[?mode=<mode>&connection=<connection>]`, e.g.
+/// `decklink://0?mode=1080p50&connection=sdi`. The decklink elements register
+/// no GStreamer URI handler, so the daemon maps the scheme itself -- device
+/// number after the `//` (first card if omitted), `mode` and `connection`
+/// passed through to `decklinkvideosrc` verbatim.
+pub struct DecklinkInput {
+    device_number: u32,
+    props: String,
+}
+
+impl DecklinkInput {
+    /// `Some` iff `uri` uses the decklink:// scheme; the inner `Err` is a
+    /// malformed decklink URI.
+    pub fn parse(uri: &str) -> Option<Result<Self, EngineError>> {
+        uri.get(..11)
+            .filter(|scheme| scheme.eq_ignore_ascii_case("decklink://"))
+            .map(|_| Self::parse_rest(&uri[11..]))
+    }
+
+    fn parse_rest(rest: &str) -> Result<Self, EngineError> {
+        let (device, query) = rest.split_once('?').unwrap_or((rest, ""));
+
+        let device_number: u32 = if device.is_empty() {
+            0
+        } else {
+            device.parse().map_err(|_| {
+                EngineError::BuildFailed(format!(
+                    "decklink device must be a number, got '{device}' (the first card is decklink://0)"
+                ))
+            })?
+        };
+
+        let mut props = String::new();
+        for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            if !matches!(key, "mode" | "connection") {
+                return Err(EngineError::BuildFailed(format!(
+                    "unknown decklink parameter '{key}' (supported: mode, connection)"
+                )));
+            }
+            // The value lands in a gst-launch string, so keep it to the
+            // charset the element's enum nicks use; GStreamer then rejects
+            // anything not in the enum with the full list of valid values.
+            if value.is_empty() || !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                return Err(EngineError::BuildFailed(format!(
+                    "invalid decklink {key} '{value}' (see gst-inspect-1.0 decklinkvideosrc)"
+                )));
+            }
+            props.push_str(&format!(" {key}={value}"));
+        }
+
+        Ok(Self {
+            device_number,
+            props,
+        })
+    }
+
+    fn video_source(&self) -> String {
+        format!(
+            "decklinkvideosrc device-number={}{} ! queue ! videoconvert ! videoscale",
+            self.device_number, self.props
+        )
+    }
+
+    /// Audio tap for `--audio`: a capture card carries audio on a sibling
+    /// element rather than a demuxer pad, so this replaces the `decoder.` tap
+    /// the generated audio branch would otherwise link to.
+    pub fn audio_tap(&self) -> String {
+        format!(
+            "decklinkaudiosrc device-number={} ! queue ! audio/x-raw",
+            self.device_number
+        )
     }
 }
 
@@ -557,5 +637,41 @@ mod tests {
     #[test]
     fn rejects_uris_without_a_scheme() {
         assert!(GStreamerEngine::uri_source_pipeline("127.0.0.1:9000").is_err());
+    }
+
+    #[test]
+    fn creates_a_decklink_pipeline_for_decklink_uris() {
+        let pipeline =
+            GStreamerEngine::uri_source_pipeline("decklink://1?mode=1080p50&connection=sdi")
+                .expect("valid decklink URI should build a source pipeline");
+
+        assert!(pipeline.contains("decklinkvideosrc device-number=1 mode=1080p50 connection=sdi"));
+    }
+
+    #[test]
+    fn decklink_device_defaults_to_zero() {
+        let pipeline = GStreamerEngine::uri_source_pipeline("decklink://")
+            .expect("bare decklink URI should build a source pipeline");
+
+        assert!(pipeline.contains("device-number=0"));
+    }
+
+    #[test]
+    fn rejects_unknown_decklink_parameters() {
+        assert!(GStreamerEngine::uri_source_pipeline("decklink://0?gain=3").is_err());
+        assert!(GStreamerEngine::uri_source_pipeline("decklink://0?mode=10 80p50").is_err());
+        assert!(GStreamerEngine::uri_source_pipeline("decklink://zero").is_err());
+    }
+
+    #[test]
+    fn decklink_audio_tap_follows_the_device_number() {
+        let input = super::DecklinkInput::parse("decklink://2?mode=1080p50")
+            .expect("decklink scheme")
+            .expect("valid URI");
+
+        assert_eq!(
+            input.audio_tap(),
+            "decklinkaudiosrc device-number=2 ! queue ! audio/x-raw"
+        );
     }
 }

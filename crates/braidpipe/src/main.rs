@@ -25,7 +25,8 @@ struct Args {
     #[arg(short = 'i', long, conflicts_with = "uri")]
     source: Option<String>,
 
-    /// Input URI decoded by GStreamer's uridecodebin3 (for example: srt://, udp://, rtp://, or ndi://)
+    /// Input URI decoded by GStreamer's uridecodebin3 (for example: srt://, udp://, rtp://, or
+    /// ndi://), or a Blackmagic capture card via decklink://<device>[?mode=..&connection=..]
     #[arg(long, value_name = "URI", conflicts_with = "source")]
     uri: Option<String>,
 
@@ -147,7 +148,16 @@ async fn run() -> Result<(), AppError> {
     };
 
     let audio_branch = if args.audio {
-        let branch = preset::audio_branch()?;
+        // A decklink source has no demuxer to tap: its audio comes from the
+        // sibling decklinkaudiosrc on the same card. A malformed decklink URI
+        // is ignored here -- pipeline construction rejects it properly below.
+        let decklink_tap = args
+            .uri
+            .as_deref()
+            .and_then(braidpipe_engine::pipeline::DecklinkInput::parse)
+            .and_then(Result::ok)
+            .map(|input| input.audio_tap());
+        let branch = preset::audio_branch(decklink_tap.as_deref())?;
         // The generated branch links two elements by name; make sure both
         // exist before GStreamer fails with a much less helpful message. A
         // BRAIDPIPE_AUDIO_BRANCH override may tap anything it likes.
