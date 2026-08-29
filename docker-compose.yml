@@ -1,7 +1,7 @@
 # braidpipe + an external Python worker, talking over a shared socket volume.
 #
 #   docker compose up --build
-#   ffplay udp://127.0.0.1:9720                    # watch the output
+#   ffplay 'srt://127.0.0.1:8891?latency=200'      # watch the output
 #
 # The shared-memory segment is anonymous: its fd crosses the container
 # boundary inside the daemon's UDS reply, so only the socket directory needs
@@ -24,21 +24,28 @@ services:
       - --rust-sock=/sockets/rust.sock
       - --python-sock=/sockets/python.sock
       - --preset=lowlatency
-      # MPEG-TS over UDP to the host; watch it with `ffplay udp://127.0.0.1:9720`.
-      # Chosen as the default because it never blocks: an srt:// listener
-      # output stalls the entire pipeline until the first viewer connects.
-      - --output=udp://host.docker.internal:9720
+      # SRT in and out. The input dials an SRT source on the host (e.g. a
+      # MediaMTX/OBS listener on 8890) -- host.docker.internal is 127.0.0.1
+      # seen from inside the container. The output listens on 8891; watch it
+      # with `ffplay 'srt://127.0.0.1:8891?latency=200'`. Note the pipeline
+      # waits for the first viewer before frames start moving.
+      - --uri=srt://host.docker.internal:8890?mode=caller&latency=200
+      - --output=srt://0.0.0.0:8891?mode=listener&latency=200
+      # Embedded audio is carried through (decoded, re-encoded to AAC, muxed).
+      - --audio
       # Real-world alternatives:
       # - --output=rtmp://my-server/live/stream
-      # - --output=srt://0.0.0.0:9710?mode=listener   (publish 9710/udp; the
-      #   pipeline waits for a viewer before frames start moving)
-      # No --uri: the default test pattern. For a real ingest, e.g.:
-      # - --uri=srt://0.0.0.0:9000?mode=listener   (and publish 9000/udp)
+      # - --output=udp://host.docker.internal:9720   (never blocks on a viewer;
+      #   watch with `ffplay udp://127.0.0.1:9720`)
+      # - --uri=srt://0.0.0.0:9000?mode=listener   (accept a publisher instead
+      #   of dialing one; publish 9000/udp)
+      # Drop --uri (and --audio) to fall back to the built-in test pattern.
     extra_hosts:
       - host.docker.internal:host-gateway   # so the Linux engine resolves it too
     volumes:
       - sockets:/sockets
     ports:
+      - "8891:8891/udp"   # SRT output listener (SRT rides on UDP)
       - "9185:9185"       # metrics, only live with --profile metrics
     restart: unless-stopped
 
