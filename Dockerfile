@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # The braidpipe daemon. Build context is the repository root.
 
-FROM rust:1-bookworm AS builder
+FROM rust:1-trixie AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -15,7 +15,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release -p braidpipe \
     && cp target/release/braidpipe /usr/local/bin/braidpipe
 
-FROM debian:bookworm-slim
+# trixie ships GStreamer 1.26: bookworm's 1.22 decodebin3 cannot drive the
+# two parse-time branches (video + --audio tap) and dies with `not-linked`.
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgstreamer1.0-0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
