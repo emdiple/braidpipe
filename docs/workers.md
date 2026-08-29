@@ -53,22 +53,22 @@ Four rules keep the stream healthy:
 3. **Always send an ack, and never die sending it.** Report `"success": false` for a failed frame — the relay treats that as a failure and passes the original through, which is exactly right. Wrap the send in `try/except OSError`; a full datagram buffer (`ENOBUFS`) is normal backpressure, not a fatal condition.
 4. **Frames are RGB, not BGR.** OpenCV's conventions assume BGR, so the familiar `(0, 0, 255)` "red" renders as blue here. Use `(255, 0, 0)` for red, or convert with `cv2.cvtColor` if you're feeding a model trained on BGR.
 
-Point `--python-script` at your own file. Because Python puts the script's own directory on `sys.path`, a worker living beside `shm.py` can `from shm import attach` directly; from elsewhere, add `python/braidpipe` to `sys.path` or install it as a package.
+Point `--python-script` at your own file. The simplest start is a copy of [worker.py](../python/braidpipe/worker.py): the whole contract with an empty `process()` hook to fill in. Because Python puts the script's own directory on `sys.path`, a worker living beside `shm.py` can `from shm import attach` directly; from elsewhere, add `python/braidpipe` to `sys.path` (the bundled examples do exactly this) or install it as a package.
 
 ## Bundled examples
 
-Four workers ship with the project, each self-contained and runnable as-is:
+The generic template lives with the transport layer; the demonstration workers live in [examples/](../examples/). Each is self-contained and runnable as-is:
 
 | Worker | Needs | Shows |
 | --- | --- | --- |
-| [worker.py](../python/braidpipe/worker.py) | opencv | The minimum contract: a text overlay and a frame counter |
-| [worker_edges.py](../python/braidpipe/worker_edges.py) | opencv | A whole-frame pixel transform, reporting `success: false` instead of dying, and both transports — set `BRAIDPIPE_DAEMON` for [tcp-raw](#workers-on-another-machine-tcp-raw) |
-| [worker_detect.py](../python/braidpipe/worker_detect.py) | ultralytics, torch | A model too slow to run inline, moved to a thread with cached results |
-| [worker_stamp.py](../python/braidpipe/worker_stamp.py) | numpy | Instrumentation rather than transform — see [Measuring latency](operations.md#measuring-latency) |
+| [worker.py](../python/braidpipe/worker.py) | numpy | The raw contract, nothing else: attach, receive, free, ack — your code goes in its `process()` hook |
+| [worker_edges.py](../examples/worker_edges.py) | opencv | A whole-frame pixel transform, reporting `success: false` instead of dying, and both transports — set `BRAIDPIPE_DAEMON` for [tcp-raw](#workers-on-another-machine-tcp-raw) |
+| [worker_detect.py](../examples/worker_detect.py) | ultralytics, torch | A model too slow to run inline, moved to a thread with cached results |
+| [worker_stamp.py](../examples/worker_stamp.py) | numpy | Instrumentation rather than transform — see [Measuring latency](operations.md#measuring-latency) |
 
 ```bash
-cargo run -p braidpipe --release -- --python-script python/braidpipe/worker_edges.py
-cargo run -p braidpipe --release -- --python-script python/braidpipe/worker_detect.py
+cargo run -p braidpipe --release -- --python-script examples/worker_edges.py
+cargo run -p braidpipe --release -- --python-script examples/worker_detect.py
 ```
 
 `worker_edges.py` is the one to reach for when testing the plumbing: no model, no network, and it rewrites only the left half of the frame so the boundary between processed and untouched pixels is visible on screen.
@@ -122,10 +122,10 @@ cargo run -p braidpipe --release -- \
   --audio
 
 # terminal 2 — whenever ready; the output switches to annotated frames on its first ack
-.venv/bin/python3 python/braidpipe/worker_detect.py
+.venv/bin/python3 examples/worker_detect.py
 ```
 
-In this mode nothing picks the interpreter for you — managed mode's automatic `.venv/bin/python3` preference belongs to the spawn path, so point at the environment that has the worker's dependencies yourself. The bundled workers (except the minimal `worker.py`) read `BRAIDPIPE_RUST_SOCK` / `BRAIDPIPE_PYTHON_SOCK` if the daemon's socket paths were overridden. Stopping the worker drops the stream back to passthrough within the failure streak (~1 s at 30 fps); relaunching it re-attaches through the same hello handshake, no daemon restart involved.
+In this mode nothing picks the interpreter for you — managed mode's automatic `.venv/bin/python3` preference belongs to the spawn path, so point at the environment that has the worker's dependencies yourself. All the bundled workers read `BRAIDPIPE_RUST_SOCK` / `BRAIDPIPE_PYTHON_SOCK` if the daemon's socket paths were overridden. Stopping the worker drops the stream back to passthrough within the failure streak (~1 s at 30 fps); relaunching it re-attaches through the same hello handshake, no daemon restart involved.
 
 One metric changes meaning: the daemon can't know whether a process it doesn't own is alive, so in this mode `braidpipe_worker_up` means "delivered a successful AI frame within the last 2 seconds" rather than "my child process is running", and `worker_exits_total` / `worker_last_exit_code` / CPU / RSS are never populated.
 
@@ -141,7 +141,7 @@ cargo run -p braidpipe --release -- --external-worker --worker-listen 0.0.0.0:73
 
 # machine B — the edge worker, pointed at the daemon (of the bundled
 # workers, worker_edges.py is the one with the remote-transport switch)
-BRAIDPIPE_DAEMON=192.168.1.10:7300 python3 worker_edges.py
+BRAIDPIPE_DAEMON=192.168.1.10:7300 python3 examples/worker_edges.py
 ```
 
 The worker's hello (`{"type": "hello", "transports": ["tcp-raw"]}`) is answered with `{"type": "config", "transport": "tcp-raw", "data_port": …, "width": …, "height": …, "channels": …, "format": "rgb"}`. The worker then opens one TCP connection to `data_port`, and every frame in either direction is a fixed 24-byte header plus the raw pixels — [python/braidpipe/remote.py](../python/braidpipe/remote.py) wraps this in the same attach-and-loop shape the shm side has:

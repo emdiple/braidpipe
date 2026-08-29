@@ -135,7 +135,7 @@ echo "Publishing ${width}x${height}@${fps} for ${duration}s via $encoder..."
 ./target/release/braidpipe \
     --source "videotestsrc is-live=true pattern=ball ! video/x-raw,width=$width,height=$height,framerate=$fps/1" \
     --sink "$sink_desc" \
-    --python-script python/braidpipe/worker_stamp.py \
+    --python-script examples/worker_stamp.py \
     --width "$width" --height "$height" --fps "$fps" >"$daemon_log" 2>&1 &
 braidpipe_pid=$!
 

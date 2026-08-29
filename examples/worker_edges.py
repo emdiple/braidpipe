@@ -7,10 +7,10 @@ in a couple of milliseconds, and any change you make is impossible to miss on
 screen.
 
 Usage:
-    cargo run -p braidpipe --release -- --python-script python/braidpipe/worker_edges.py
+    cargo run -p braidpipe --release -- --python-script examples/worker_edges.py
 
     # or from another machine, against a daemon started with --worker-listen:
-    BRAIDPIPE_DAEMON=192.168.1.10:7300 python3 worker_edges.py
+    BRAIDPIPE_DAEMON=192.168.1.10:7300 python3 examples/worker_edges.py
 
 Environment:
     BRAIDPIPE_DAEMON        daemon's --worker-listen address; switches this
@@ -24,12 +24,21 @@ Environment:
 import json
 import os
 import socket
+import sys
 import time
 
 import cv2
 import numpy as np
-from remote import connect as remote_connect
-from shm import attach
+
+# The transport layer lives in python/braidpipe/, a sibling of this examples/
+# directory; in the worker image everything is flattened into one directory,
+# where this insert resolves to nothing and the plain import already works.
+sys.path.insert(
+    0,
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python", "braidpipe"),
+)
+from remote import connect as remote_connect  # noqa: E402
+from shm import attach  # noqa: E402
 
 DAEMON = os.environ.get("BRAIDPIPE_DAEMON")
 RUST_SOCK = os.environ.get("BRAIDPIPE_RUST_SOCK", "/tmp/braidpipe_rust.sock")
