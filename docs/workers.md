@@ -99,6 +99,16 @@ Any language that can receive a file descriptor over a Unix datagram socket (`re
 
 The repository root's [docker-compose.yml](../docker-compose.yml) is a working example of exactly this arrangement: daemon and worker in separate containers, sharing only the directory holding the two sockets — the shared-memory fd crosses the container boundary inside the daemon's socket reply, so no `/dev/shm` mount or `ipc: host` is needed, and Docker's `restart: unless-stopped` supplies the worker respawn the daemon deliberately omits.
 
+That compose stack is also the easiest place to watch the failover machinery work. With a stream flowing, stop the worker container and the picture keeps playing — only the AI effect disappears:
+
+```bash
+docker compose logs -f braidpipe | grep -i branch   # terminal 1: the branch switches
+docker compose stop worker    # log flips to Passthrough within the failure streak (~1 s)
+docker compose start worker   # the hello handshake re-attaches; log flips back to AiProcess
+```
+
+Note the distinction the restart policy draws: a manual `docker compose stop` (or `docker kill`) marks the container manually stopped, so `restart: unless-stopped` leaves it down until you start it again — which is what makes this a controlled test. Only a worker that dies on its own (a crash, an OOM kill, an unhandled exception) triggers Docker's automatic respawn, and then the whole cycle — passthrough, restart, hello, back to the AI branch — runs hands-free. The worker image has no `pkill` and the worker runs as PID 1, so a simulated in-container crash isn't available; a real one behaves exactly like the stop/start pair, just without you typing the second command.
+
 Everything else is identical to managed mode. The daemon still creates the shared memory segment and binds its socket; the external process implements the same [IPC contract](#the-ipc-contract) that `worker.py` does (all the bundled workers run unchanged either way). Startup order doesn't matter: until a worker acks, the stream runs on passthrough, and the first good frame selects the AI branch — the same machinery that handles failover recovery. If the external process dies, the stream falls back to passthrough and picks up its replacement whenever one appears.
 
 A full example — a live SRT relay with audio, joined later by the YOLO worker started by hand:

@@ -1,0 +1,28 @@
+# GPU overlay: hands the daemon container a GPU so decode and encode run on
+# hardware. The base image already carries the plugins (nvcodec, va); this file
+# only grants device access, so the default stack keeps working on GPU-less
+# machines. Usage, on a Linux host:
+#
+#   # NVIDIA (needs the nvidia-container-toolkit installed on the host)
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+#
+# Verify in the logs: "Video encoder in use (hardware) element=nvh264enc"
+# (or vah264enc) and "Hardware decoders promoted for autoplugging".
+# BRAIDPIPE_HW=off in the environment turns both directions back off.
+
+services:
+  braidpipe:
+    environment:
+      # `video` is what exposes NVENC/NVDEC; without it only compute crosses.
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Intel/AMD instead of NVIDIA: comment out the deploy block above and hand
+    # the render node in -- the image's va-driver-all covers both vendors.
+    # devices:
+    #   - /dev/dri:/dev/dri
