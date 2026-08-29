@@ -113,11 +113,23 @@ kill -9 <pid from the "Python worker active pid=…" log line>
 The repo ships a compose stack that runs the daemon and a worker as separate containers, sharing only a socket volume — the shared memory itself is anonymous, so its fd crosses the container boundary inside the daemon's socket reply, with no `/dev/shm` mount and no `ipc: host`:
 
 ```bash
+# the daemon dials an SRT source on the host's :8890 -- OBS, MediaMTX, or a test feed:
+gst-launch-1.0 videotestsrc is-live=true ! x264enc tune=zerolatency \
+    ! mpegtsmux ! srtsink uri='srt://0.0.0.0:8890?mode=listener'
+
 docker compose up --build
-ffplay udp://127.0.0.1:9720   # the edge-transformed test pattern
+ffplay -fflags nobuffer 'srt://127.0.0.1:8891?latency=200'   # the edge-transformed feed
 ```
 
-`restart: unless-stopped` on the worker service is what closes the daemon's deliberate no-respawn gap: a crashed worker container is restarted by Docker, says hello again, and the stream returns from passthrough to the AI branch — measured at ~365 ms of passthrough for a hard worker crash. Swap the worker or the input/output by editing `command:` in [docker-compose.yml](docker-compose.yml); `docker compose --profile metrics up` additionally bridges the Prometheus endpoint to `http://127.0.0.1:9185/metrics`.
+`restart: unless-stopped` on the worker service is what closes the daemon's deliberate no-respawn gap: a crashed worker container is restarted by Docker, says hello again, and the stream returns from passthrough to the AI branch — measured at ~365 ms of passthrough for a hard worker crash. To watch that failover happen:
+
+```bash
+docker compose logs -f braidpipe | grep -i branch   # terminal 1: the branch switches
+docker compose stop worker    # video keeps playing; the log flips to Passthrough
+docker compose start worker   # worker says hello again; the log flips back to AiProcess
+```
+
+A manual `stop` (or `docker kill`) suppresses the restart policy, so the worker stays down as long as the test needs — Docker's auto-respawn only fires when the worker dies on its own, which is exactly the case the stream is protecting against. Swap the worker or the input/output by editing `command:` in [docker-compose.yml](docker-compose.yml); `docker compose --profile metrics up` additionally bridges the Prometheus endpoint to `http://127.0.0.1:9185/metrics`. On macOS, Docker Desktop's userspace UDP proxy can fail SRT handshakes on published ports — enable *Use kernel networking for UDP* in its network settings.
 
 ## A real stream
 
