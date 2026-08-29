@@ -18,10 +18,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # trixie ships GStreamer 1.26: bookworm's 1.22 decodebin3 cannot drive the
 # two parse-time branches (video + --audio tap) and dies with `not-linked`.
 FROM debian:trixie-slim
+# va-driver-all supplies the VA-API backends (Intel media / Mesa for AMD) so
+# vah264enc/dec light up when /dev/dri is passed in. The NVIDIA path needs no
+# libraries here: the nvcodec plugin dlopens the driver libs the NVIDIA
+# container toolkit injects at run time (see docker-compose.gpu.yml).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgstreamer1.0-0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
-        ca-certificates \
+        va-driver-all ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/braidpipe /usr/local/bin/braidpipe
 ENTRYPOINT ["braidpipe"]
