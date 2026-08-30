@@ -130,7 +130,7 @@ for preset in $presets; do
     ./target/release/braidpipe \
         --source "$source" \
         --preset "$preset" --output "rtmp://127.0.0.1:$port/live/stream" \
-        --python-script python/braidpipe/worker_stamp.py \
+        --python-script examples/worker_stamp.py \
         --width "$width" --height "$height" --fps "$fps" \
         >"$workdir/$preset.log" 2>&1 &
     braidpipe_pid=$!

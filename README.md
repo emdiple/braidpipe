@@ -95,14 +95,14 @@ Run from the repository root so the default worker path resolves:
 cargo run -p braidpipe --release
 ```
 
-That builds a 1280×720 test pattern, runs it through the bundled worker (which draws a frame counter onto each frame), and displays the result with `autovideosink`. You should see the overlay text updating on a moving ball.
+That builds a 1280×720 test pattern, runs every frame through the bundled raw worker ([python/braidpipe/worker.py](python/braidpipe/worker.py) — the template to copy for your own, it acks each frame untouched), and displays the result with `autovideosink`. The `Python worker active pid=…` log line is the proof the AI loop is closed; for a transform you can see, run the edge example below.
 
 ```bash
 # the media path alone, no Python involved
 cargo run -p braidpipe --release -- --passthrough-only
 
-# a different worker: a Canny edge transform on the left half of the frame
-cargo run -p braidpipe --release -- --python-script python/braidpipe/worker_edges.py
+# a visible worker: a Canny edge transform on the left half of the frame
+cargo run -p braidpipe --release -- --python-script examples/worker_edges.py
 
 # kill the worker mid-stream and watch the output keep running
 kill -9 <pid from the "Python worker active pid=…" log line>
@@ -171,7 +171,7 @@ while True:
     sock.sendto(ack(packet, success=True), "/tmp/braidpipe_rust.sock")
 ```
 
-Finish inside 1.5 frame periods, always free the slot, always ack (`"success": false` on failure is correct and safe), and remember frames are RGB, not BGR. Four examples ship in [python/braidpipe/](python/braidpipe/) — text overlay, edge transform, threaded YOLO detection, and clock stamping — and the contract is language-agnostic: [examples/worker.rs](crates/braidpipe-ipc/examples/worker.rs) is the same worker in Rust.
+Finish inside 1.5 frame periods, always free the slot, always ack (`"success": false` on failure is correct and safe), and remember frames are RGB, not BGR. [python/braidpipe/worker.py](python/braidpipe/worker.py) is that contract with an empty `process()` hook — copy it and fill the hook in. Three worked examples ship in [examples/](examples/) — edge transform, threaded YOLO detection, and clock stamping — and the contract is language-agnostic: [worker.rs](crates/braidpipe-ipc/examples/worker.rs) is the same worker in Rust.
 
 Workers do not have to be launched by the daemon. `--external-worker` attaches a process you own (a container, a service, something started by hand), and `--worker-listen` accepts workers from other machines over the tcp-raw transport. Full contract and every attach mode: [AI workers](docs/workers.md).
 
@@ -195,7 +195,8 @@ Ports and adapters, so the availability logic can be tested without GStreamer or
 | [crates/braidpipe-engine/](crates/braidpipe-engine/) | GStreamer adapter: pipeline construction, branch switching, bus error reporting, and the macOS run-loop wrapper. |
 | [crates/braidpipe-ipc/](crates/braidpipe-ipc/) | The shared-memory ring buffer, the Unix-datagram control bridge with its health tracking, and the tcp-raw network transport, plus [examples/worker.rs](crates/braidpipe-ipc/examples/worker.rs) — a worker written in Rust. |
 | [crates/braidpipe/](crates/braidpipe/) | The daemon: CLI, wiring, worker supervision, [preset.rs](crates/braidpipe/src/preset.rs) — the latency/bandwidth profiles — and [relay.rs](crates/braidpipe/src/relay.rs) — the appsink → shm → Python → appsrc data path. |
-| [python/braidpipe/](python/braidpipe/) | `shm.py` (the Rust layout mirror), `remote.py` (the tcp-raw client), `stamp.py` (the latency barcode), and four example workers. |
+| [python/braidpipe/](python/braidpipe/) | The generic worker layer: `worker.py` (the raw template with an empty `process()` hook), `shm.py` (the Rust layout mirror), and `remote.py` (the tcp-raw client). |
+| [examples/](examples/) | The demonstration workers — edge transform, threaded YOLO detection, clock stamping — plus `stamp.py`, the latency barcode they share with the probe. |
 | [docs/](docs/) | The detailed guides linked above. |
 | [scripts/](scripts/) | Manual end-to-end checks, the latency harness, and the per-preset bandwidth measurement. |
 | [monitoring/](monitoring/) | Prometheus + Grafana compose stack: scrape config, alert rules, provisioned dashboard. |

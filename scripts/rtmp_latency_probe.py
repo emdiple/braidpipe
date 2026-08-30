@@ -24,7 +24,7 @@ import numpy as np
 
 sys.path.insert(
     0,
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python", "braidpipe"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples"),
 )
 from stamp import PAYLOAD_MASK, decode  # noqa: E402
 

@@ -12,7 +12,7 @@ worker waking up is the SHM + UDS delivery cost.
 Used by scripts/rtmp-latency.sh, but it works against any sink.
 
 Usage:
-    cargo run -p braidpipe --release -- --python-script python/braidpipe/worker_stamp.py
+    cargo run -p braidpipe --release -- --python-script examples/worker_stamp.py
 
 Environment:
     BRAIDPIPE_STAMP_BUSY_MS   fake per-frame workload    (default: 0)
@@ -24,10 +24,18 @@ Environment:
 import json
 import os
 import socket
+import sys
 import time
 
-from shm import attach
-from stamp import encode
+# The transport layer lives in python/braidpipe/, a sibling of this examples/
+# directory; in the worker image everything is flattened into one directory,
+# where this insert resolves to nothing and the plain import already works.
+sys.path.insert(
+    0,
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python", "braidpipe"),
+)
+from shm import attach  # noqa: E402
+from stamp import encode  # noqa: E402
 
 RUST_SOCK = os.environ.get("BRAIDPIPE_RUST_SOCK", "/tmp/braidpipe_rust.sock")
 PYTHON_SOCK = os.environ.get("BRAIDPIPE_PYTHON_SOCK", "/tmp/braidpipe_python.sock")

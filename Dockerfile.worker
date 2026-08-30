@@ -1,13 +1,16 @@
 # syntax=docker/dockerfile:1
 # A Python worker image. Build context is the repository root.
 #
-# Ships every bundled worker plus shm.py/remote.py; pick one with the compose
-# service's `command:` (default: worker_edges.py). worker_detect.py would
-# additionally need `pip install ultralytics` and the yolov8n.pt weights.
+# Flattens the generic layer (worker.py, shm.py, remote.py) and the example
+# workers into one directory, so every script finds its imports beside itself;
+# pick one with the compose service's `command:` (default: worker_edges.py).
+# worker_detect.py would additionally need `pip install ultralytics` and the
+# yolov8n.pt weights.
 
 FROM python:3.12-slim
 RUN pip install --no-cache-dir numpy opencv-python-headless
 WORKDIR /app
 COPY python/braidpipe/ ./
+COPY examples/ ./
 ENTRYPOINT ["python3", "-u"]
 CMD ["worker_edges.py"]

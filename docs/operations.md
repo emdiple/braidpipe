@@ -47,7 +47,7 @@ Or just use the PID the daemon already printed, which is the same number.
 Nothing respawns the worker (see [Known limitations](../README.md#known-limitations)), but you can start one by hand and the daemon picks it up on its next successful frame — verified: `branch=AiProcess` returns within a couple of seconds:
 
 ```bash
-.venv/bin/python3 python/braidpipe/worker_edges.py
+.venv/bin/python3 examples/worker_edges.py
 ```
 
 Run it from the repository root, and note that a hand-started worker is no longer a child of the daemon, so the `pgrep -P` trick above will not find it a second time.
@@ -66,7 +66,7 @@ bash scripts/rtmp-latency.sh
 
 This publishes a test pattern over RTMP and reports how late every frame was when a receiver got it. It needs nothing installed beyond ffmpeg: `-listen 1` makes ffmpeg the RTMP server braidpipe publishes to *and* the decoder, so no media server sits in the middle inflating the number.
 
-There is no OCR and no guessing. [worker_stamp.py](../python/braidpipe/worker_stamp.py) writes the wall clock into every frame as a row of large black-and-white cells, and [rtmp_latency_probe.py](../scripts/rtmp_latency_probe.py) reads it back out of the decoded pixels and subtracts. Both processes are on one machine reading one clock, so this is a true one-way measurement rather than a halved round trip. Big cells are the point: H.264 will smear a thin line, but block-coded black and white survive any bitrate worth streaming — the runs below decoded 100% of frames.
+There is no OCR and no guessing. [worker_stamp.py](../examples/worker_stamp.py) writes the wall clock into every frame as a row of large black-and-white cells, and [rtmp_latency_probe.py](../scripts/rtmp_latency_probe.py) reads it back out of the decoded pixels and subtracts. Both processes are on one machine reading one clock, so this is a true one-way measurement rather than a halved round trip. Big cells are the point: H.264 will smear a thin line, but block-coded black and white survive any bitrate worth streaming — the runs below decoded 100% of frames.
 
 Measured on an M-series Mac, 1280x720 @ 30 fps, `x264enc tune=zerolatency speed-preset=ultrafast`, medians over ~700 frames:
 
