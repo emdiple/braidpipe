@@ -33,3 +33,6 @@ venv/
 
 # local developer's files
 .local/
+
+#
+/visual-output-quality-test
