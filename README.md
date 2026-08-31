@@ -24,7 +24,7 @@ The Rust daemon owns the media path. Python only ever sees pixels in a shared-me
  NDI / camera / file │                                                         │
         ──────────►  │  decode ──┬── queue ─────────┐                          │
                      │           │                  ▼                          │
-                     │           │           input-selector ──► encode ──► sink│──────►  RTMP / SRT
+                     │           │           input-selector ──► encode ──► sink│──────►  SRT / RTMP
                      │           │                  ▲                          │         UDP / display
                      │           └── appsink ──┐  appsrc                       │
                      │                         │    │                          │
@@ -135,12 +135,13 @@ A manual `stop` (or `docker kill`) suppresses the restart policy, so the worker 
 
 ## A real stream
 
-Ingest SRT, publish RTMP, with the encoder built from a latency/bandwidth profile:
+Ingest SRT, publish SRT, with the encoder built from a latency/bandwidth profile:
 
 ```bash
 cargo run -p braidpipe --release -- \
   --uri 'srt://0.0.0.0:9000?mode=listener' \
-  --preset lowlatency --output rtmp://localhost/live/stream
+  --preset lowlatency --output 'srt://0.0.0.0:8891?mode=listener'
+# watch it: ffplay 'srt://127.0.0.1:8891?latency=200'
 ```
 
 `--output` takes `rtmp://`, `srt://` or `udp://host:port` and picks the muxer to match; `--preset` is one of `zerolatency`, `lowlatency` (default), `balanced`, `bandwidth`. Add `--audio` to carry the source's audio around the AI branch. The flags you'll reach for most:

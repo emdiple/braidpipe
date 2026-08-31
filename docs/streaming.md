@@ -15,15 +15,15 @@ Everything between the input URI and the output URL: real sources and sinks, the
 
 ## Real-world pipelines
 
-**SRT in, RTMP out** — the common broadcast shape:
+**SRT in, SRT out** — the common broadcast shape:
 
 ```bash
 cargo run -p braidpipe --release -- \
   --uri 'srt://0.0.0.0:9000?mode=listener' \
   --sink 'videoconvert ! video/x-raw,format=I420 \
           ! x264enc tune=zerolatency bitrate=4000 speed-preset=veryfast key-int-max=60 \
-          ! h264parse config-interval=-1 ! flvmux streamable=true \
-          ! rtmp2sink sync=false location=rtmp://localhost/live/stream'
+          ! h264parse config-interval=-1 ! mpegtsmux \
+          ! srtsink sync=false uri="srt://0.0.0.0:8891?mode=listener&latency=200"'
 ```
 
 `sync=false` is not incidental — it is worth about 48 ms, for the reasons in [Measuring latency](operations.md#measuring-latency).
@@ -40,7 +40,7 @@ cargo run -p braidpipe --release -- --uri 'ndi://Studio%20Camera' --sink 'videoc
 cargo run -p braidpipe --release -- \
   --uri 'decklink://0?mode=1080p50&connection=sdi' \
   --width 1920 --height 1080 --fps 50 \
-  --preset lowlatency --output rtmp://localhost/live/stream
+  --preset lowlatency --output 'srt://0.0.0.0:8891?mode=listener'
 ```
 
 `decklinkvideosrc` registers no GStreamer URI handler, so the daemon maps this scheme itself: the number after `//` is the card (`decklink://` alone means the first one), and the optional `mode` and `connection` query parameters go straight to the element — `gst-inspect-1.0 decklinkvideosrc` lists the valid values, and `mode=auto` follows whatever the deck delivers on cards that support format detection. Needs the `decklink` plugin from gst-plugins-bad and Blackmagic's Desktop Video drivers installed. `--audio` works here too: a capture card has no demuxer to tap, so the audio branch is sourced from `decklinkaudiosrc` on the same device number, picking up the embedded SDI/HDMI audio.
@@ -87,7 +87,7 @@ Writing the sink by hand, as above, gives full control — but most deployments 
 ```bash
 cargo run -p braidpipe --release -- \
   --uri 'srt://0.0.0.0:9000?mode=listener' \
-  --preset lowlatency --output rtmp://localhost/live/stream
+  --preset lowlatency --output 'srt://0.0.0.0:8891?mode=listener'
 ```
 
 `--output` understands `rtmp://`, `srt://` and `udp://host:port`, and picks the right mux for each (FLV for RTMP, MPEG-TS for SRT/UDP). The daemon logs the sink it built at startup, so you can copy it out and use it as a `--sink` starting point.
@@ -133,7 +133,7 @@ cargo run -p braidpipe --release -- \
   --uri 'ndi://Studio%20Camera' \
   --width 1920 --height 1080 --fps 50 \
   --preset lowlatency --encoder auto \
-  --output rtmp://localhost/live/stream
+  --output 'srt://0.0.0.0:8891?mode=listener'
 ```
 
 Why these values and nothing else:
@@ -213,7 +213,7 @@ Real sources carry audio, and the output should too. `--audio` routes the source
 ```bash
 cargo run -p braidpipe --release -- \
   --uri 'srt://0.0.0.0:9000?mode=listener' \
-  --audio --preset lowlatency --output rtmp://localhost/live/stream
+  --audio --preset lowlatency --output 'srt://0.0.0.0:8891?mode=listener'
 ```
 
 **How sync works.** There is no dedicated sync machinery, because none is needed: the relay pushes every video frame back into the pipeline with its **original PTS** — whether the worker processed it or the deadline passed and it went through unchanged — and audio keeps the PTS the source gave it. The muxer pairs the two streams by timestamp, exactly as it would in a plain GStreamer pipeline. That also means failover cannot desynchronize anything: the input-selector switches video branches while audio never stops flowing.
