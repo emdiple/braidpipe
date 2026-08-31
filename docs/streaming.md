@@ -9,6 +9,7 @@ Everything between the input URI and the output URL: real sources and sinks, the
   - [Recipe: NDI 1080p50, low latency, high quality](#recipe-ndi-1080p50-low-latency-high-quality)
   - [Measured bandwidth](#measured-bandwidth)
 - [GPU acceleration](#gpu-acceleration)
+  - [In docker](#in-docker)
 - [Audio passthrough](#audio-passthrough)
 - [Command-line reference](#command-line-reference)
 
@@ -190,6 +191,20 @@ Two knobs control this, each a CLI flag with an environment-variable twin (the f
 - `--encoder <name>` (or `BRAIDPIPE_ENCODER=<name>`) — pin the encoder regardless of detection; `--encoder auto` explicitly re-enables detection. Hardware encoders trade some quality-per-bit for speed, so the `bandwidth` preset's intent is best served by pinning `x264`. Pinning the encoder leaves GPU *decoding* on — use `--hw off` to force software both ways.
 
 A hand-written `--sink` bypasses encoder selection entirely — you name the encoder yourself.
+
+### In docker
+
+The plain compose stack is software-only by design — it must run anywhere. On a Linux host with an NVIDIA GPU, add the GPU overlay:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build -d
+```
+
+It builds a `braidpipe-cuda` image on the `nvidia/cuda` base and hands the container every GPU; success is the same log line as everywhere else, `Video encoder in use (hardware) element=nvh264enc`.
+
+`--build` — on this command and on the plain `docker compose up` alike — is only needed the first time and after something the image is built *from* changes — Rust source, `Cargo.toml`/`Cargo.lock`, the Dockerfiles, the worker's Python files, or build args. Compose never detects source changes on its own: without the flag it silently runs the stale image. Edits to the compose files themselves (flags, environment, ports) need no rebuild — plain `up -d` recreates the container with the new settings. Rebuilds are incremental thanks to the Dockerfile's cargo cache mount, so a habitual `--build` costs seconds, not the full compile. The two variants keep separate tags (`braidpipe` and `braidpipe-cuda`), so building one never clobbers the other — but each needs its own `--build` after a code change. The host needs the NVIDIA driver working (`nvidia-smi`) and the `nvidia-container-toolkit` registered with docker — the overlay's header comments carry the check and install commands. For Intel/AMD VA-API instead, the header shows how to swap the GPU reservation for a `/dev/dri` device mount; the image already ships `va-driver-all`.
+
+On macOS there is no GPU path in docker at all — Docker Desktop cannot pass the GPU through, so a containerized daemon always encodes with x264. Run the daemon natively (`cargo run`) to get VideoToolbox.
 
 ## Audio passthrough
 
