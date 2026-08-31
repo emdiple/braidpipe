@@ -1,7 +1,15 @@
 # syntax=docker/dockerfile:1
 # The braidpipe daemon. Build context is the repository root.
+#
+# The two bases are swappable so the NVIDIA path can build on nvidia/cuda; the
+# gpu overlay sets both (see docker-compose.gpu.yml). They move as a pair: the
+# binary is dynamically linked, so the builder's glibc must be no newer than the
+# runtime's. trixie is 2.41, bookworm 2.36, Ubuntu 24.04 2.39 -- which is why the
+# cuda variant drops the builder to bookworm.
+ARG BUILDER_BASE=rust:1-trixie
+ARG RUNTIME_BASE=debian:trixie-slim
 
-FROM rust:1-trixie AS builder
+FROM ${BUILDER_BASE} AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -17,11 +25,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # trixie ships GStreamer 1.26: bookworm's 1.22 decodebin3 cannot drive the
 # two parse-time branches (video + --audio tap) and dies with `not-linked`.
-FROM debian:trixie-slim
+# Ubuntu 24.04 (the cuda variant) is 1.24, past that bug but not yet 1.26.
+FROM ${RUNTIME_BASE}
 # va-driver-all supplies the VA-API backends (Intel media / Mesa for AMD) so
 # vah264enc/dec light up when /dev/dri is passed in. The NVIDIA path needs no
-# libraries here: the nvcodec plugin dlopens the driver libs the NVIDIA
-# container toolkit injects at run time (see docker-compose.gpu.yml).
+# libraries here: gstreamer1.0-plugins-bad already carries libgstnvcodec.so on
+# both bases, and it dlopens the driver's libcuda/libnvidia-encode/libnvcuvid,
+# which only the NVIDIA container toolkit can inject at run time -- no image can
+# ship them (see docker-compose.gpu.yml).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgstreamer1.0-0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
