@@ -33,7 +33,12 @@ FROM ${RUNTIME_BASE}
 # both bases, and it dlopens the driver's libcuda/libnvidia-encode/libnvcuvid,
 # which only the NVIDIA container toolkit can inject at run time -- no image can
 # ship them (see docker-compose.gpu.yml).
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#
+# The cuda base ships NVIDIA's own apt repo, and developer.download.nvidia.com
+# geoblocks some regions with a 403 that fails the whole update. Nothing below
+# comes from that repo, so drop it; a no-op on the debian base.
+RUN rm -f /etc/apt/sources.list.d/cuda*.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
         libgstreamer1.0-0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
         va-driver-all ca-certificates \
