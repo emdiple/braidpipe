@@ -16,6 +16,10 @@
 //!   BRAIDPIPE_VBV_BUF_MS    x264 VBV buffer, bounds bitrate bursts
 //!   BRAIDPIPE_SINK_SYNC     1/0, clock-sync the network sink
 //!   BRAIDPIPE_SRT_LATENCY_MS  srtsink receive-side latency budget
+//!   BRAIDPIPE_SRT_WAIT_FOR_CONNECTION  1/0, srtsink blocks until a caller
+//!                           connects (default 0: run and drop output until
+//!                           a viewer arrives, so the input is consumed
+//!                           from the moment the pipeline starts)
 //!   BRAIDPIPE_AUDIO_ENCODER      AAC encoder element (default avenc_aac)
 //!   BRAIDPIPE_AUDIO_BITRATE_KBPS audio target bitrate (default 128)
 //!   BRAIDPIPE_AUDIO_BRANCH       replace the generated audio branch outright
@@ -46,6 +50,11 @@ pub struct Params {
     /// source already paces the pipeline.
     pub sync: bool,
     pub srt_latency_ms: u32,
+    /// wait-for-connection on srtsink. GStreamer's default (true) holds the
+    /// whole pipeline in preroll until the first viewer connects -- so the
+    /// input is not even consumed. False keeps the stream running and drops
+    /// output packets until a caller arrives, which fits a live relay.
+    pub srt_wait_for_connection: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +139,7 @@ fn defaults(preset: &str) -> Option<Params> {
             sync: false,
             vbv_buf_ms: 100,
             srt_latency_ms: 50,
+            srt_wait_for_connection: false,
         },
         // The measured sweet spot: keeps the ~40ms p50 of the tuned harness
         // sink while veryfast claws back most of ultrafast's wasted bits.
@@ -142,6 +152,7 @@ fn defaults(preset: &str) -> Option<Params> {
             sync: false,
             vbv_buf_ms: 200,
             srt_latency_ms: 125,
+            srt_wait_for_connection: false,
         },
         "balanced" => Params {
             encoder: Encoder::X264,
@@ -152,6 +163,7 @@ fn defaults(preset: &str) -> Option<Params> {
             sync: false,
             vbv_buf_ms: 500,
             srt_latency_ms: 250,
+            srt_wait_for_connection: false,
         },
         // Minimum bits for the quality: B-frames and lookahead come back,
         // which adds several frames of encoder delay by design.
@@ -164,6 +176,7 @@ fn defaults(preset: &str) -> Option<Params> {
             sync: true,
             vbv_buf_ms: 1000,
             srt_latency_ms: 500,
+            srt_wait_for_connection: false,
         },
         _ => return None,
     };
@@ -258,6 +271,9 @@ fn resolve(
     if let Some(v) = env("BRAIDPIPE_SRT_LATENCY_MS") {
         p.srt_latency_ms = parse_num("BRAIDPIPE_SRT_LATENCY_MS", &v)?;
     }
+    if let Some(v) = env("BRAIDPIPE_SRT_WAIT_FOR_CONNECTION") {
+        p.srt_wait_for_connection = parse_bool("BRAIDPIPE_SRT_WAIT_FOR_CONNECTION", &v)?;
+    }
     Ok(p)
 }
 
@@ -321,9 +337,14 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
     let mux_and_sink = if output.starts_with("rtmp://") {
         format!("flvmux name=mux streamable=true ! rtmp2sink {sync} location={output}")
     } else if output.starts_with("srt://") {
+        // The leaky queue keeps a stalled or slow receiver from backpressuring
+        // the encoder: packets drop at the sink instead of the stream falling
+        // behind real time.
         format!(
-            "mpegtsmux name=mux alignment=7 ! srtsink {sync} latency={} uri={output}",
-            p.srt_latency_ms
+            "mpegtsmux name=mux alignment=7 ! \
+             queue max-size-buffers=3 leaky=downstream ! \
+             srtsink {sync} wait-for-connection={} latency={} uri={output}",
+            p.srt_wait_for_connection, p.srt_latency_ms
         )
     } else if let Some(rest) = output.strip_prefix("udp://") {
         let (host, port) = rest
@@ -457,7 +478,21 @@ mod tests {
         let p = resolve("zerolatency", no_env).unwrap();
         let sink = render(&p, "srt://127.0.0.1:8888", 30).unwrap();
         assert!(sink.contains("mpegtsmux name=mux alignment=7"));
-        assert!(sink.contains("srtsink sync=false latency=50 uri=srt://127.0.0.1:8888"));
+        assert!(sink.contains("queue max-size-buffers=3 leaky=downstream"));
+        assert!(sink.contains(
+            "srtsink sync=false wait-for-connection=false latency=50 uri=srt://127.0.0.1:8888"
+        ));
+    }
+
+    #[test]
+    fn srt_wait_for_connection_env_override() {
+        let p = resolve("lowlatency", |key| {
+            (key == "BRAIDPIPE_SRT_WAIT_FOR_CONNECTION").then(|| "1".to_string())
+        })
+        .unwrap();
+        assert!(p.srt_wait_for_connection);
+        let sink = render(&p, "srt://127.0.0.1:8888", 30).unwrap();
+        assert!(sink.contains("wait-for-connection=true"));
     }
 
     #[test]

@@ -114,6 +114,7 @@ Bitrates assume 720p30 — scale them for other formats. A preset only decides d
 | `BRAIDPIPE_VBV_BUF_MS` | x264 VBV buffer (burst bound) | milliseconds |
 | `BRAIDPIPE_SINK_SYNC` | sink clock sync | `1`/`0` — see [Measuring latency](operations.md#measuring-latency) for why `0` is worth ~48 ms |
 | `BRAIDPIPE_SRT_LATENCY_MS` | `srtsink` latency budget | milliseconds |
+| `BRAIDPIPE_SRT_WAIT_FOR_CONNECTION` | `srtsink` blocking on a missing viewer | `1`/`0` — default `0`: the pipeline runs and drops output until a viewer connects, so the input is consumed from startup |
 
 ```bash
 # lowlatency profile, but cap the bandwidth

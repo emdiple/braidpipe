@@ -33,8 +33,9 @@ services:
       # SRT in and out. The input dials an SRT source on the host (e.g. a
       # MediaMTX/OBS listener on 8890) -- host.docker.internal is 127.0.0.1
       # seen from inside the container. The output listens on 8891; watch it
-      # with `ffplay 'srt://127.0.0.1:8891?latency=200'`. Note the pipeline
-      # waits for the first viewer before frames start moving.
+      # with `ffplay 'srt://127.0.0.1:8891?latency=200'`. The pipeline runs
+      # with or without a viewer -- output packets just drop until one
+      # connects (BRAIDPIPE_SRT_WAIT_FOR_CONNECTION=1 restores blocking).
       - --uri=srt://host.docker.internal:8890?mode=caller&latency=200
       - --output=srt://0.0.0.0:8891?mode=listener&latency=200
       # Embedded audio is carried through (decoded, re-encoded to AAC, muxed).
