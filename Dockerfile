@@ -28,4 +28,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         va-driver-all ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/braidpipe /usr/local/bin/braidpipe
+# NVIDIA container runtime hints, same as the official CUDA images: when the
+# container is granted a GPU (--gpus all / the compose gpu overlay), these tell
+# the toolkit to inject the driver's encode/decode libs and nvidia-smi. Inert
+# everywhere else -- plain runc ignores them.
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 ENTRYPOINT ["braidpipe"]
