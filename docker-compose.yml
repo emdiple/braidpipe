@@ -1,7 +1,7 @@
 # braidpipe + an external Python worker, talking over a shared socket volume.
 #
 #   docker compose up --build
-#   ffplay 'srt://127.0.0.1:8891?latency=200'      # watch the output
+#   ffplay 'srt://127.0.0.1:8891?latency=120'      # watch the output
 #
 # The shared-memory segment is anonymous: its fd crosses the container
 # boundary inside the daemon's UDS reply, so only the socket directory needs
@@ -33,11 +33,11 @@ services:
       # SRT in and out. The input dials an SRT source on the host (e.g. a
       # MediaMTX/OBS listener on 8890) -- host.docker.internal is 127.0.0.1
       # seen from inside the container. The output listens on 8891; watch it
-      # with `ffplay 'srt://127.0.0.1:8891?latency=200'`. The pipeline runs
+      # with `ffplay 'srt://127.0.0.1:8891?latency=120'`. The pipeline runs
       # with or without a viewer -- output packets just drop until one
       # connects (BRAIDPIPE_SRT_WAIT_FOR_CONNECTION=1 restores blocking).
-      - --uri=srt://host.docker.internal:8890?mode=caller&latency=200
-      - --output=srt://0.0.0.0:8891?mode=listener&latency=200
+      - --uri=srt://host.docker.internal:8890?mode=caller&latency=120
+      - --output=srt://0.0.0.0:8891?mode=listener&latency=120
       # Embedded audio is carried through (decoded, re-encoded to AAC, muxed).
       - --audio
       # Real-world alternatives:
@@ -55,6 +55,13 @@ services:
       # software 1080p50 encode past real time. Every preset parameter can be
       # overridden the same way; see crates/braidpipe/src/preset.rs.
       BRAIDPIPE_BITRATE_KBPS: "16000"
+      # 1 s keyframes (key-int-max=50 at 50 fps): after packet loss the picture
+      # heals at the next IDR, so on a lossy SRT link a short GOP buys visible
+      # robustness for a small quality-per-bit cost -- affordable at 16 Mbps.
+      BRAIDPIPE_GOP_SECONDS: "1"
+      # Keep the sink's SRT budget equal to the input's; the URIs above say
+      # 120 too, this just makes the pair explicit in one place.
+      BRAIDPIPE_SRT_LATENCY_MS: "120"
     extra_hosts:
       - host.docker.internal:host-gateway   # so the Linux engine resolves it too
     volumes:
