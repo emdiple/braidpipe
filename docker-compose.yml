@@ -67,6 +67,16 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.worker
+      args:
+        # For networks where pypi.org is unreachable: run the build as
+        #   PIP_INDEX_URL=https://mirror-pypi.runflare.com/simple docker compose up --build
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+      # For resolvers that blackhole pypi.org (return 0.0.0.0) while the CDN
+      # itself is reachable: pin PyPI's Fastly addresses past the broken DNS.
+      # Harmless where DNS is healthy -- these are PyPI's real anycast IPs.
+      extra_hosts:
+        - pypi.org:151.101.64.223
+        - files.pythonhosted.org:151.101.64.223
     image: braidpipe-worker
     # command: ["worker_stamp.py"]   # or any other bundled/own worker
     environment:
