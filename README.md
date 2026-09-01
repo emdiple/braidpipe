@@ -217,6 +217,7 @@ Ports and adapters, so the availability logic can be tested without GStreamer or
 cargo test --workspace
 cargo clippy --workspace --all-targets
 cargo fmt --all
+python3 -m unittest discover python/tests   # the SDK against a fake daemon; also run in CI
 ```
 
 `relay.rs` is the place to start reading if you want to understand or change frame handling: it's short, and every failure path in it exists to protect the never-dark guarantee.
@@ -238,7 +239,7 @@ Each run writes a folder under `vmaf-test/runs/` with the capture, the per-frame
 - **Full-frame RGB only.** The alpha-overlay compositing path — where Python returns just a mask to be blended, instead of a whole frame — is not implemented yet.
 - **Frames are copied, not zero-copy, on the Rust side.** Each frame is copied out of the GStreamer buffer into shared memory and back. Python's view is genuinely zero-copy; Rust's is not.
 - **tcp-raw frames are uncompressed.** The remote-worker transport ships raw RGB, so it is LAN-only in practice; a compressed or subsampled wire format is not implemented yet (the config packet's `format` field exists so one can be negotiated later without breaking workers).
-- **The Python SDK is not on PyPI yet.** The `braidpipe` package in [python/](python/) wraps the whole worker loop (`braidpipe.run()`, both transports), but installing it still means `pip install python/` from a checkout. Publishing to PyPI — and a version field in the handshake so a mismatched daemon/SDK pair fails loudly — is the next piece of work.
+- **The Python SDK is not on PyPI yet.** The `braidpipe` package in [python/](python/) wraps the whole worker loop (`braidpipe.run()`, both transports), the name is free, and [publish-pypi.yml](.github/workflows/publish-pypi.yml) publishes it on every `v*` tag — but the release flow still needs a maintainer to register the trusted publisher on pypi.org (the one-time setup is described at the top of that workflow). Until then, installing means `pip install python/` from a checkout.
 
 ## Contributing
 
