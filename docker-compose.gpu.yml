@@ -1,7 +1,6 @@
-# GPU overlay: hands the daemon container a GPU so decode and encode run on
-# hardware. The base image already carries the plugins (nvcodec, va); this file
-# only grants device access, so the default stack keeps working on GPU-less
-# machines. Usage, on a Linux host:
+# GPU overlay: builds the daemon on nvidia/cuda and hands the container a GPU so
+# decode and encode run on hardware. Kept separate so the default stack keeps
+# working on GPU-less machines. Usage, on a Linux host:
 #
 #   # NVIDIA (needs the nvidia-container-toolkit installed on the host)
 #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
@@ -9,9 +8,30 @@
 # Verify in the logs: "Video encoder in use (hardware) element=nvh264enc"
 # (or vah264enc) and "Hardware decoders promoted for autoplugging".
 # BRAIDPIPE_HW=off in the environment turns both directions back off.
+#
+# What the cuda base does and does not buy: it ships the CUDA runtime and a
+# libcuda.so.1 compat layer, but NOT libnvidia-encode/libnvcuvid -- those come
+# only from the host toolkit, on any base. So if NVENC is missing, check the
+# toolkit first; this base will not substitute for it:
+#
+#   docker run --rm --gpus all -e NVIDIA_DRIVER_CAPABILITIES=compute,video,utility \
+#     debian:trixie-slim ls /usr/lib/x86_64-linux-gnu | grep libnvidia-encode
+#
+# Empty output means the toolkit is not installed or not registered as a runtime:
+#   sudo apt-get install -y nvidia-container-toolkit
+#   sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
 
 services:
   braidpipe:
+    build:
+      args:
+        # Ubuntu 24.04 is glibc 2.39, so the builder drops to bookworm (2.36) --
+        # the trixie builder's 2.41 would not run here. Cost of the swap:
+        # GStreamer 1.24 instead of 1.26.
+        BUILDER_BASE: rust:1-bookworm
+        RUNTIME_BASE: nvidia/cuda:12.6.3-runtime-ubuntu24.04
+    # Distinct tag so a later non-overlay `up` cannot silently run this build.
+    image: braidpipe-cuda
     environment:
       # `video` is what exposes NVENC/NVDEC; without it only compute crosses.
       NVIDIA_DRIVER_CAPABILITIES: compute,video,utility

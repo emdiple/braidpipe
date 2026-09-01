@@ -24,7 +24,7 @@ The Rust daemon owns the media path. Python only ever sees pixels in a shared-me
  NDI / camera / file │                                                         │
         ──────────►  │  decode ──┬── queue ─────────┐                          │
                      │           │                  ▼                          │
-                     │           │           input-selector ──► encode ──► sink│──────►  RTMP / SRT
+                     │           │           input-selector ──► encode ──► sink│──────►  SRT / RTMP
                      │           │                  ▲                          │         UDP / display
                      │           └── appsink ──┐  appsrc                       │
                      │                         │    │                          │
@@ -121,6 +121,14 @@ docker compose up --build
 ffplay -fflags nobuffer 'srt://127.0.0.1:8891?latency=200'   # the edge-transformed feed
 ```
 
+On a Linux host with an NVIDIA GPU, the GPU overlay moves decode and encode onto the card (NVDEC + `nvh264enc`); prerequisites and the VA-API alternative are in [streaming.md](docs/streaming.md#in-docker):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build -d
+```
+
+After the first build, plain `docker compose up -d` is enough; `--build` is needed again only when source, Dockerfiles, or build args change — the rules (they apply to the GPU overlay too) are in [streaming.md](docs/streaming.md#in-docker).
+
 `restart: unless-stopped` on the worker service is what closes the daemon's deliberate no-respawn gap: a crashed worker container is restarted by Docker, says hello again, and the stream returns from passthrough to the AI branch — measured at ~365 ms of passthrough for a hard worker crash. To watch that failover happen:
 
 ```bash
@@ -133,12 +141,13 @@ A manual `stop` (or `docker kill`) suppresses the restart policy, so the worker 
 
 ## A real stream
 
-Ingest SRT, publish RTMP, with the encoder built from a latency/bandwidth profile:
+Ingest SRT, publish SRT, with the encoder built from a latency/bandwidth profile:
 
 ```bash
 cargo run -p braidpipe --release -- \
   --uri 'srt://0.0.0.0:9000?mode=listener' \
-  --preset lowlatency --output rtmp://localhost/live/stream
+  --preset lowlatency --output 'srt://0.0.0.0:8891?mode=listener'
+# watch it: ffplay 'srt://127.0.0.1:8891?latency=200'
 ```
 
 `--output` takes `rtmp://`, `srt://` or `udp://host:port` and picks the muxer to match; `--preset` is one of `zerolatency`, `lowlatency` (default), `balanced`, `bandwidth`. Add `--audio` to carry the source's audio around the AI branch. The flags you'll reach for most:
@@ -199,6 +208,7 @@ Ports and adapters, so the availability logic can be tested without GStreamer or
 | [examples/](examples/) | The demonstration workers — edge transform, threaded YOLO detection, clock stamping — plus `stamp.py`, the latency barcode they share with the probe. |
 | [docs/](docs/) | The detailed guides linked above. |
 | [scripts/](scripts/) | Manual end-to-end checks, the latency harness, and the per-preset bandwidth measurement. |
+| [vmaf-test/](vmaf-test/) | VMAF quality measurement of the encode path over SRT — see [its README](vmaf-test/README.md). |
 | [monitoring/](monitoring/) | Prometheus + Grafana compose stack: scrape config, alert rules, provisioned dashboard. |
 | [assets/](assets/) | Logo files: transparent wordmark and icon PNGs, plus a multi-size `.ico`. |
 
@@ -211,6 +221,16 @@ cargo fmt --all
 ```
 
 `relay.rs` is the place to start reading if you want to understand or change frame handling: it's short, and every failure path in it exists to protect the never-dark guarantee.
+
+## Measuring encode quality (with VMAF)
+
+How much visual quality does the decode → re-encode path cost? [vmaf-test/](vmaf-test/) answers that with [VMAF](https://github.com/Netflix/vmaf): it streams a reference file into a `--passthrough-only` daemon over SRT, captures the SRT output, and scores the two against each other frame by frame.
+
+```bash
+python3 vmaf-test/run_vmaf_test.py source.mp4
+```
+
+Each run writes a folder under `vmaf-test/runs/` with the capture, the per-frame scores, the daemon log, and a markdown report whose headline is the pooled VMAF mean (≥ 93 is visually transparent). Presets, SRT latency, `BRAIDPIPE_*` overrides and arbitrary daemon flags are all parameters, and an already-running SRT feed can stand in for the built-in one — see [vmaf-test/README.md](vmaf-test/README.md).
 
 ## Known limitations
 

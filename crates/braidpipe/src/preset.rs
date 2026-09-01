@@ -16,6 +16,10 @@
 //!   BRAIDPIPE_VBV_BUF_MS    x264 VBV buffer, bounds bitrate bursts
 //!   BRAIDPIPE_SINK_SYNC     1/0, clock-sync the network sink
 //!   BRAIDPIPE_SRT_LATENCY_MS  srtsink receive-side latency budget
+//!   BRAIDPIPE_SRT_WAIT_FOR_CONNECTION  1/0, srtsink blocks until a caller
+//!                           connects (default 0: run and drop output until
+//!                           a viewer arrives, so the input is consumed
+//!                           from the moment the pipeline starts)
 //!   BRAIDPIPE_AUDIO_ENCODER      AAC encoder element (default avenc_aac)
 //!   BRAIDPIPE_AUDIO_BITRATE_KBPS audio target bitrate (default 128)
 //!   BRAIDPIPE_AUDIO_BRANCH       replace the generated audio branch outright
@@ -46,6 +50,11 @@ pub struct Params {
     /// source already paces the pipeline.
     pub sync: bool,
     pub srt_latency_ms: u32,
+    /// wait-for-connection on srtsink. GStreamer's default (true) holds the
+    /// whole pipeline in preroll until the first viewer connects -- so the
+    /// input is not even consumed. False keeps the stream running and drops
+    /// output packets until a caller arrives, which fits a live relay.
+    pub srt_wait_for_connection: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +139,7 @@ fn defaults(preset: &str) -> Option<Params> {
             sync: false,
             vbv_buf_ms: 100,
             srt_latency_ms: 50,
+            srt_wait_for_connection: false,
         },
         // The measured sweet spot: keeps the ~40ms p50 of the tuned harness
         // sink while veryfast claws back most of ultrafast's wasted bits.
@@ -142,6 +152,7 @@ fn defaults(preset: &str) -> Option<Params> {
             sync: false,
             vbv_buf_ms: 200,
             srt_latency_ms: 125,
+            srt_wait_for_connection: false,
         },
         "balanced" => Params {
             encoder: Encoder::X264,
@@ -152,6 +163,7 @@ fn defaults(preset: &str) -> Option<Params> {
             sync: false,
             vbv_buf_ms: 500,
             srt_latency_ms: 250,
+            srt_wait_for_connection: false,
         },
         // Minimum bits for the quality: B-frames and lookahead come back,
         // which adds several frames of encoder delay by design.
@@ -164,6 +176,7 @@ fn defaults(preset: &str) -> Option<Params> {
             sync: true,
             vbv_buf_ms: 1000,
             srt_latency_ms: 500,
+            srt_wait_for_connection: false,
         },
         _ => return None,
     };
@@ -258,6 +271,9 @@ fn resolve(
     if let Some(v) = env("BRAIDPIPE_SRT_LATENCY_MS") {
         p.srt_latency_ms = parse_num("BRAIDPIPE_SRT_LATENCY_MS", &v)?;
     }
+    if let Some(v) = env("BRAIDPIPE_SRT_WAIT_FOR_CONNECTION") {
+        p.srt_wait_for_connection = parse_bool("BRAIDPIPE_SRT_WAIT_FOR_CONNECTION", &v)?;
+    }
     Ok(p)
 }
 
@@ -273,21 +289,38 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
                 p.speed_preset, p.bitrate_kbps, p.vbv_buf_ms
             )
         }
+        // CBR is what makes the bitrate number mean something on VideoToolbox:
+        // its default ABR undershoots easy content (encoding at an internal
+        // ~0.5 quality point with the budget left unspent) and bursts far past
+        // the target on hard scenes with no VBV to bound it. Constant bitrate
+        // does both of the jobs x264's VBV does. The quality knob only applies
+        // if rate control is ever ABR again; under CBR VideoToolbox ignores it.
         Encoder::Vtenc => format!(
             "vtenc_h264 realtime={} allow-frame-reordering={} bitrate={} \
-             max-keyframe-interval={keyint}",
+             max-keyframe-interval={keyint} rate-control=cbr quality=0.65",
             p.zerolatency, !p.zerolatency, p.bitrate_kbps
         ),
         // The hardware encoders below all take kbps like x264, but each has
         // its own name for the GOP and its own shape of low-latency switch.
         // The VBV bound carries over where the encoder exposes one (NVENC's
         // vbv-buffer-size, VA's cpb-size, both in kbit).
+        // cbr-ld-hq is the low-delay high-quality flavor of CBR and
+        // zerolatency=true removes the reordering delay outright; b-adapt and
+        // bframes only restate their defaults, but this tuning depends on
+        // them, so they are pinned. The caps keep the encoder from quietly
+        // negotiating down from high profile, which every NVENC supports.
         Encoder::Nvenc => format!(
-            "nvh264enc bitrate={} gop-size={keyint} rc-mode=cbr preset={} \
-             vbv-buffer-size={}",
+            "nvh264enc bitrate={} gop-size={keyint} rc-mode={} preset={} \
+             vbv-buffer-size={}{} ! video/x-h264,profile=high",
             p.bitrate_kbps,
+            if p.zerolatency { "cbr-ld-hq" } else { "cbr" },
             if p.zerolatency { "low-latency-hq" } else { "hq" },
-            p.bitrate_kbps * p.vbv_buf_ms / 1000
+            p.bitrate_kbps * p.vbv_buf_ms / 1000,
+            if p.zerolatency {
+                " b-adapt=false bframes=0 zerolatency=true"
+            } else {
+                ""
+            }
         ),
         Encoder::Va => format!(
             "vah264enc bitrate={} key-int-max={keyint} target-usage={} cpb-size={}",
@@ -321,9 +354,14 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
     let mux_and_sink = if output.starts_with("rtmp://") {
         format!("flvmux name=mux streamable=true ! rtmp2sink {sync} location={output}")
     } else if output.starts_with("srt://") {
+        // The leaky queue keeps a stalled or slow receiver from backpressuring
+        // the encoder: packets drop at the sink instead of the stream falling
+        // behind real time.
         format!(
-            "mpegtsmux name=mux alignment=7 ! srtsink {sync} latency={} uri={output}",
-            p.srt_latency_ms
+            "mpegtsmux name=mux alignment=7 ! \
+             queue max-size-buffers=3 leaky=downstream ! \
+             srtsink {sync} wait-for-connection={} latency={} uri={output}",
+            p.srt_wait_for_connection, p.srt_latency_ms
         )
     } else if let Some(rest) = output.strip_prefix("udp://") {
         let (host, port) = rest
@@ -337,11 +375,14 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
         ));
     };
 
-    // I420 pinned before the encoder: left to caps negotiation from the RGB
-    // the AI branch deals in, videoconvert offers 4:4:4 -- twice the samples
-    // for no benefit over these transports.
+    // A 4:2:0 format pinned before the encoder: left to caps negotiation from
+    // the RGB the AI branch deals in, videoconvert offers 4:4:4 -- twice the
+    // samples for no benefit over these transports. x264 gets its native
+    // planar I420; the hardware encoders are NV12-native (biplanar), which
+    // spares them an internal repack per frame. Same chroma either way.
+    let raw_format = if p.encoder == Encoder::X264 { "I420" } else { "NV12" };
     Ok(format!(
-        "videoconvert ! video/x-raw,format=I420 ! {encoder} ! \
+        "videoconvert ! video/x-raw,format={raw_format} ! {encoder} ! \
          h264parse config-interval=-1 ! {mux_and_sink}"
     ))
 }
@@ -457,7 +498,21 @@ mod tests {
         let p = resolve("zerolatency", no_env).unwrap();
         let sink = render(&p, "srt://127.0.0.1:8888", 30).unwrap();
         assert!(sink.contains("mpegtsmux name=mux alignment=7"));
-        assert!(sink.contains("srtsink sync=false latency=50 uri=srt://127.0.0.1:8888"));
+        assert!(sink.contains("queue max-size-buffers=3 leaky=downstream"));
+        assert!(sink.contains(
+            "srtsink sync=false wait-for-connection=false latency=50 uri=srt://127.0.0.1:8888"
+        ));
+    }
+
+    #[test]
+    fn srt_wait_for_connection_env_override() {
+        let p = resolve("lowlatency", |key| {
+            (key == "BRAIDPIPE_SRT_WAIT_FOR_CONNECTION").then(|| "1".to_string())
+        })
+        .unwrap();
+        assert!(p.srt_wait_for_connection);
+        let sink = render(&p, "srt://127.0.0.1:8888", 30).unwrap();
+        assert!(sink.contains("wait-for-connection=true"));
     }
 
     #[test]
@@ -512,11 +567,19 @@ mod tests {
         };
 
         // lowlatency: 4500 kbps, 2s GOP at 30fps = 60, 200ms VBV = 900 kbit.
+        let vtenc = with_encoder("vtenc");
+        assert!(vtenc.contains(
+            "vtenc_h264 realtime=true allow-frame-reordering=false bitrate=4500 \
+             max-keyframe-interval=60 rate-control=cbr quality=0.65"
+        ));
+
         let nvenc = with_encoder("nvenc");
         assert!(nvenc.contains(
-            "nvh264enc bitrate=4500 gop-size=60 rc-mode=cbr preset=low-latency-hq \
-             vbv-buffer-size=900"
+            "nvh264enc bitrate=4500 gop-size=60 rc-mode=cbr-ld-hq preset=low-latency-hq \
+             vbv-buffer-size=900 b-adapt=false bframes=0 zerolatency=true ! \
+             video/x-h264,profile=high"
         ));
+        assert!(nvenc.contains("video/x-raw,format=NV12"));
 
         let va = with_encoder("va");
         assert!(va.contains("vah264enc bitrate=4500 key-int-max=60 target-usage=6 cpb-size=900"));

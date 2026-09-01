@@ -9,20 +9,21 @@ Everything between the input URI and the output URL: real sources and sinks, the
   - [Recipe: NDI 1080p50, low latency, high quality](#recipe-ndi-1080p50-low-latency-high-quality)
   - [Measured bandwidth](#measured-bandwidth)
 - [GPU acceleration](#gpu-acceleration)
+  - [In docker](#in-docker)
 - [Audio passthrough](#audio-passthrough)
 - [Command-line reference](#command-line-reference)
 
 ## Real-world pipelines
 
-**SRT in, RTMP out** — the common broadcast shape:
+**SRT in, SRT out** — the common broadcast shape:
 
 ```bash
 cargo run -p braidpipe --release -- \
   --uri 'srt://0.0.0.0:9000?mode=listener' \
   --sink 'videoconvert ! video/x-raw,format=I420 \
           ! x264enc tune=zerolatency bitrate=4000 speed-preset=veryfast key-int-max=60 \
-          ! h264parse config-interval=-1 ! flvmux streamable=true \
-          ! rtmp2sink sync=false location=rtmp://localhost/live/stream'
+          ! h264parse config-interval=-1 ! mpegtsmux \
+          ! srtsink sync=false uri="srt://0.0.0.0:8891?mode=listener&latency=200"'
 ```
 
 `sync=false` is not incidental — it is worth about 48 ms, for the reasons in [Measuring latency](operations.md#measuring-latency).
@@ -39,7 +40,7 @@ cargo run -p braidpipe --release -- --uri 'ndi://Studio%20Camera' --sink 'videoc
 cargo run -p braidpipe --release -- \
   --uri 'decklink://0?mode=1080p50&connection=sdi' \
   --width 1920 --height 1080 --fps 50 \
-  --preset lowlatency --output rtmp://localhost/live/stream
+  --preset lowlatency --output 'srt://0.0.0.0:8891?mode=listener'
 ```
 
 `decklinkvideosrc` registers no GStreamer URI handler, so the daemon maps this scheme itself: the number after `//` is the card (`decklink://` alone means the first one), and the optional `mode` and `connection` query parameters go straight to the element — `gst-inspect-1.0 decklinkvideosrc` lists the valid values, and `mode=auto` follows whatever the deck delivers on cards that support format detection. Needs the `decklink` plugin from gst-plugins-bad and Blackmagic's Desktop Video drivers installed. `--audio` works here too: a capture card has no demuxer to tap, so the audio branch is sourced from `decklinkaudiosrc` on the same device number, picking up the embedded SDI/HDMI audio.
@@ -86,7 +87,7 @@ Writing the sink by hand, as above, gives full control — but most deployments 
 ```bash
 cargo run -p braidpipe --release -- \
   --uri 'srt://0.0.0.0:9000?mode=listener' \
-  --preset lowlatency --output rtmp://localhost/live/stream
+  --preset lowlatency --output 'srt://0.0.0.0:8891?mode=listener'
 ```
 
 `--output` understands `rtmp://`, `srt://` and `udp://host:port`, and picks the right mux for each (FLV for RTMP, MPEG-TS for SRT/UDP). The daemon logs the sink it built at startup, so you can copy it out and use it as a `--sink` starting point.
@@ -113,6 +114,7 @@ Bitrates assume 720p30 — scale them for other formats. A preset only decides d
 | `BRAIDPIPE_VBV_BUF_MS` | x264 VBV buffer (burst bound) | milliseconds |
 | `BRAIDPIPE_SINK_SYNC` | sink clock sync | `1`/`0` — see [Measuring latency](operations.md#measuring-latency) for why `0` is worth ~48 ms |
 | `BRAIDPIPE_SRT_LATENCY_MS` | `srtsink` latency budget | milliseconds |
+| `BRAIDPIPE_SRT_WAIT_FOR_CONNECTION` | `srtsink` blocking on a missing viewer | `1`/`0` — default `0`: the pipeline runs and drops output until a viewer connects, so the input is consumed from startup |
 
 ```bash
 # lowlatency profile, but cap the bandwidth
@@ -132,7 +134,7 @@ cargo run -p braidpipe --release -- \
   --uri 'ndi://Studio%20Camera' \
   --width 1920 --height 1080 --fps 50 \
   --preset lowlatency --encoder auto \
-  --output rtmp://localhost/live/stream
+  --output 'srt://0.0.0.0:8891?mode=listener'
 ```
 
 Why these values and nothing else:
@@ -191,6 +193,20 @@ Two knobs control this, each a CLI flag with an environment-variable twin (the f
 
 A hand-written `--sink` bypasses encoder selection entirely — you name the encoder yourself.
 
+### In docker
+
+The plain compose stack is software-only by design — it must run anywhere. On a Linux host with an NVIDIA GPU, add the GPU overlay:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build -d
+```
+
+It builds a `braidpipe-cuda` image on the `nvidia/cuda` base and hands the container every GPU; success is the same log line as everywhere else, `Video encoder in use (hardware) element=nvh264enc`.
+
+`--build` — on this command and on the plain `docker compose up` alike — is only needed the first time and after something the image is built *from* changes — Rust source, `Cargo.toml`/`Cargo.lock`, the Dockerfiles, the worker's Python files, or build args. Compose never detects source changes on its own: without the flag it silently runs the stale image. Edits to the compose files themselves (flags, environment, ports) need no rebuild — plain `up -d` recreates the container with the new settings. Rebuilds are incremental thanks to the Dockerfile's cargo cache mount, so a habitual `--build` costs seconds, not the full compile. The two variants keep separate tags (`braidpipe` and `braidpipe-cuda`), so building one never clobbers the other — but each needs its own `--build` after a code change. The host needs the NVIDIA driver working (`nvidia-smi`) and the `nvidia-container-toolkit` registered with docker — the overlay's header comments carry the check and install commands. For Intel/AMD VA-API instead, the header shows how to swap the GPU reservation for a `/dev/dri` device mount; the image already ships `va-driver-all`.
+
+On macOS there is no GPU path in docker at all — Docker Desktop cannot pass the GPU through, so a containerized daemon always encodes with x264. Run the daemon natively (`cargo run`) to get VideoToolbox.
+
 ## Audio passthrough
 
 Real sources carry audio, and the output should too. `--audio` routes the source's audio around the AI branch — decoded, re-encoded to AAC, and joined back at the output muxer:
@@ -198,7 +214,7 @@ Real sources carry audio, and the output should too. `--audio` routes the source
 ```bash
 cargo run -p braidpipe --release -- \
   --uri 'srt://0.0.0.0:9000?mode=listener' \
-  --audio --preset lowlatency --output rtmp://localhost/live/stream
+  --audio --preset lowlatency --output 'srt://0.0.0.0:8891?mode=listener'
 ```
 
 **How sync works.** There is no dedicated sync machinery, because none is needed: the relay pushes every video frame back into the pipeline with its **original PTS** — whether the worker processed it or the deadline passed and it went through unchanged — and audio keeps the PTS the source gave it. The muxer pairs the two streams by timestamp, exactly as it would in a plain GStreamer pipeline. That also means failover cannot desynchronize anything: the input-selector switches video branches while audio never stops flowing.

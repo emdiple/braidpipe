@@ -33,8 +33,9 @@ services:
       # SRT in and out. The input dials an SRT source on the host (e.g. a
       # MediaMTX/OBS listener on 8890) -- host.docker.internal is 127.0.0.1
       # seen from inside the container. The output listens on 8891; watch it
-      # with `ffplay 'srt://127.0.0.1:8891?latency=200'`. Note the pipeline
-      # waits for the first viewer before frames start moving.
+      # with `ffplay 'srt://127.0.0.1:8891?latency=200'`. The pipeline runs
+      # with or without a viewer -- output packets just drop until one
+      # connects (BRAIDPIPE_SRT_WAIT_FOR_CONNECTION=1 restores blocking).
       - --uri=srt://host.docker.internal:8890?mode=caller&latency=200
       - --output=srt://0.0.0.0:8891?mode=listener&latency=200
       # Embedded audio is carried through (decoded, re-encoded to AAC, muxed).
@@ -54,6 +55,13 @@ services:
       # software 1080p50 encode past real time. Every preset parameter can be
       # overridden the same way; see crates/braidpipe/src/preset.rs.
       BRAIDPIPE_BITRATE_KBPS: "16000"
+      # 1 s keyframes (key-int-max=50 at 50 fps): after packet loss the picture
+      # heals at the next IDR, so on a lossy SRT link a short GOP buys visible
+      # robustness for a small quality-per-bit cost -- affordable at 16 Mbps.
+      BRAIDPIPE_GOP_SECONDS: "1"
+      # Both legs share a 200 ms budget; the URIs above say 200 too, this
+      # just makes the pair explicit in one place.
+      BRAIDPIPE_SRT_LATENCY_MS: "200"
     extra_hosts:
       - host.docker.internal:host-gateway   # so the Linux engine resolves it too
     volumes:
@@ -67,6 +75,16 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.worker
+      args:
+        # For networks where pypi.org is unreachable: run the build as
+        #   PIP_INDEX_URL=https://mirror-pypi.runflare.com/simple docker compose up --build
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+      # For resolvers that blackhole pypi.org (return 0.0.0.0) while the CDN
+      # itself is reachable: pin PyPI's Fastly addresses past the broken DNS.
+      # Harmless where DNS is healthy -- these are PyPI's real anycast IPs.
+      extra_hosts:
+        - pypi.org:151.101.64.223
+        - files.pythonhosted.org:151.101.64.223
     image: braidpipe-worker
     # command: ["worker_stamp.py"]   # or any other bundled/own worker
     environment:

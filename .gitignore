@@ -33,3 +33,6 @@ venv/
 
 # local developer's files
 .local/
+
+# VMAF quality-test artifacts (captures, scores, logs)
+/vmaf-test/runs/
