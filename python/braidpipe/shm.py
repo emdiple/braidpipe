@@ -1,9 +1,12 @@
+import json
 import mmap
 import os
 import socket as socket_module
 import struct
 import time
 import numpy as np
+
+from .contract import check_contract
 
 # Slot State Constants matching Rust shm.rs
 SLOT_FREE = 0
@@ -46,13 +49,24 @@ def attach(sock: socket_module.socket, rust_sock_path: str, retry_interval: floa
                 time.sleep(retry_interval)
                 continue
             try:
-                _msg, fds, _flags, _addr = socket_module.recv_fds(sock, 512, 1)
+                msg, fds, _flags, _addr = socket_module.recv_fds(sock, 512, 1)
             except TimeoutError:
                 continue
             except OSError:
                 time.sleep(retry_interval)
                 continue
             if fds:
+                # The config body riding beside the fd names the daemon's
+                # contract version; refuse the fd rather than misread it.
+                try:
+                    config = json.loads(msg)
+                except ValueError:
+                    config = {}
+                try:
+                    check_contract(config, "shm")
+                except Exception:
+                    os.close(fds[0])
+                    raise
                 return SharedMemoryManager(fds[0])
             # A frame notification that raced the handshake; ignore it. The
             # daemon passes those frames through unchanged.

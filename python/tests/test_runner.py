@@ -84,7 +84,7 @@ class ShmTransportTest(unittest.TestCase):
         # (sendmsg directly: socket.send_fds does not forward `address`.)
         _, worker_addr = daemon.recvfrom(512)
         daemon.sendmsg(
-            [b'{"type":"config"}'],
+            [b'{"type":"config","transport":"shm","contract":1}'],
             [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [segment.fileno()]))],
             0,
             worker_addr,
@@ -164,6 +164,7 @@ class TcpRawTransportTest(unittest.TestCase):
                 {
                     "type": "config",
                     "transport": "tcp-raw",
+                    "contract": 1,
                     "data_port": tcp.getsockname()[1],
                     "width": WIDTH,
                     "height": HEIGHT,
@@ -194,6 +195,38 @@ class TcpRawTransportTest(unittest.TestCase):
         conn.close()
         worker.join(TIMEOUT)
         self.assertFalse(worker.is_alive())
+
+
+class ContractTest(unittest.TestCase):
+    def test_matching_and_missing_versions_attach(self):
+        from braidpipe.contract import CONTRACT_VERSION, check_contract
+
+        check_contract({"contract": CONTRACT_VERSION}, "shm")  # must not raise
+        check_contract({}, "shm")  # pre-versioning daemon: warn, not refuse
+
+    def test_mismatch_refuses_loudly(self):
+        from braidpipe.contract import check_contract
+
+        with self.assertRaises(RuntimeError):
+            check_contract({"contract": 999}, "shm")
+
+    def test_remote_connect_refuses_mismatched_daemon(self):
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.bind(("127.0.0.1", 0))
+        udp.settimeout(TIMEOUT)
+        self.addCleanup(udp.close)
+
+        def answer_hello():
+            _, addr = udp.recvfrom(512)
+            udp.sendto(
+                b'{"type":"config","transport":"tcp-raw","data_port":1,'
+                b'"width":8,"height":4,"channels":3,"contract":999}',
+                addr,
+            )
+
+        threading.Thread(target=answer_hello, daemon=True).start()
+        with self.assertRaises(RuntimeError):
+            braidpipe.connect(f"127.0.0.1:{udp.getsockname()[1]}")
 
 
 class SignatureTest(unittest.TestCase):

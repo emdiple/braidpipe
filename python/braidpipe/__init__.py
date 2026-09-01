@@ -23,6 +23,7 @@ the loop itself.
 """
 
 from .background import BackgroundModel
+from .contract import CONTRACT_VERSION
 from .remote import RemoteWorkerLink, connect
 from .runner import FrameContext, run, worker
 from .shm import SharedMemoryManager, attach
@@ -31,6 +32,7 @@ __version__ = "0.2.0"
 
 __all__ = [
     "BackgroundModel",
+    "CONTRACT_VERSION",
     "FrameContext",
     "RemoteWorkerLink",
     "SharedMemoryManager",

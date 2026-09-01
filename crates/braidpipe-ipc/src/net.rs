@@ -240,7 +240,9 @@ impl RemoteState {
                 *writer = None;
                 self.attached.store(false, Ordering::Relaxed);
                 info!(reason = "send failed", "Remote worker detached");
-                Err(IpcError::SocketError(format!("tcp-raw send failed: {error}")))
+                Err(IpcError::SocketError(format!(
+                    "tcp-raw send failed: {error}"
+                )))
             }
             Err(_) => {
                 *writer = None;
@@ -307,10 +309,15 @@ impl RemoteState {
         let h = self.shm.header();
         format!(
             concat!(
-                "{{\"type\":\"config\",\"transport\":\"tcp-raw\",\"data_port\":{},",
+                "{{\"type\":\"config\",\"transport\":\"tcp-raw\",\"contract\":{},",
+                "\"data_port\":{},",
                 "\"width\":{},\"height\":{},\"channels\":{},\"format\":\"rgb\"}}"
             ),
-            data_port, h.width, h.height, h.channels
+            crate::IPC_CONTRACT_VERSION,
+            data_port,
+            h.width,
+            h.height,
+            h.channels
         )
     }
 }
@@ -403,6 +410,7 @@ mod tests {
         let config: serde_json::Value = serde_json::from_slice(&buf[..bytes]).unwrap();
         assert_eq!(config["type"], "config");
         assert_eq!(config["transport"], "tcp-raw");
+        assert_eq!(config["contract"], crate::IPC_CONTRACT_VERSION);
         assert_eq!(config["width"], 4);
         assert_eq!(config["height"], 2);
         assert_eq!(config["channels"], 3);

@@ -86,10 +86,15 @@ impl UdsControlBridge {
         let header = shm.header();
         let shm_config = format!(
             concat!(
-                "{{\"type\":\"config\",\"transport\":\"shm\",\"width\":{},\"height\":{},",
+                "{{\"type\":\"config\",\"transport\":\"shm\",\"contract\":{},",
+                "\"width\":{},\"height\":{},",
                 "\"channels\":{},\"slots\":{},\"format\":\"rgb\"}}"
             ),
-            header.width, header.height, header.channels, header.slot_count
+            crate::IPC_CONTRACT_VERSION,
+            header.width,
+            header.height,
+            header.channels,
+            header.slot_count
         );
 
         // Sized for a few stale acks beyond the one in flight; the reader
@@ -262,8 +267,7 @@ impl AiBridge for UdsControlBridge {
         // tcp-raw connection -- AND keeping up with the frame deadlines
         // (a stale socket file survives a SIGKILL).
         let reachable = self.python_sock_path.exists() || self.remote.attached();
-        let healthy =
-            reachable && self.failure_streak.load(Ordering::Relaxed) < MAX_FAILURE_STREAK;
+        let healthy = reachable && self.failure_streak.load(Ordering::Relaxed) < MAX_FAILURE_STREAK;
         braidpipe_core::metrics::WORKER_HEALTHY.set(i64::from(healthy));
         healthy
     }
@@ -344,7 +348,11 @@ mod tests {
             msg.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as _;
 
             let bytes = libc::recvmsg(socket.as_raw_fd(), &mut msg, 0);
-            assert!(bytes >= 0, "recvmsg failed: {}", std::io::Error::last_os_error());
+            assert!(
+                bytes >= 0,
+                "recvmsg failed: {}",
+                std::io::Error::last_os_error()
+            );
 
             let cmsg = libc::CMSG_FIRSTHDR(&msg);
             assert!(!cmsg.is_null(), "no ancillary data received");
@@ -381,7 +389,11 @@ mod tests {
         let mut buf = [0u8; 128];
         let (bytes, fd) = recv_fd(&receiver, &mut buf);
         assert_eq!(&buf[..bytes], payload);
-        assert_ne!(fd, shm.fd(), "kernel must hand over a duplicate, not the same number");
+        assert_ne!(
+            fd,
+            shm.fd(),
+            "kernel must hand over a duplicate, not the same number"
+        );
 
         // The duplicate describes the same segment: fstat sees its size.
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
