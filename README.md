@@ -216,6 +216,16 @@ cargo fmt --all
 
 `relay.rs` is the place to start reading if you want to understand or change frame handling: it's short, and every failure path in it exists to protect the never-dark guarantee.
 
+## Measuring encode quality (with VMAF)
+
+How much visual quality does the decode → re-encode path cost? [vmaf-test/](vmaf-test/) answers that with [VMAF](https://github.com/Netflix/vmaf): it streams a reference file into a `--passthrough-only` daemon over SRT, captures the SRT output, and scores the two against each other frame by frame.
+
+```bash
+python3 vmaf-test/run_vmaf_test.py source.mp4
+```
+
+Each run writes a folder under `vmaf-test/runs/` with the capture, the per-frame scores, the daemon log, and a markdown report whose headline is the pooled VMAF mean (≥ 93 is visually transparent). Presets, SRT latency, `BRAIDPIPE_*` overrides and arbitrary daemon flags are all parameters, and an already-running SRT feed can stand in for the built-in one — see [vmaf-test/README.md](vmaf-test/README.md).
+
 ## Known limitations
 
 - **No worker respawn.** If the Python process dies, the daemon logs it and stays in passthrough for the rest of the run. Restart the worker manually or supervise it externally.
