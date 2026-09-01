@@ -121,6 +121,12 @@ docker compose up --build
 ffplay -fflags nobuffer 'srt://127.0.0.1:8891?latency=200'   # the edge-transformed feed
 ```
 
+On a Linux host with an NVIDIA GPU, the GPU overlay moves decode and encode onto the card (NVDEC + `nvh264enc`); prerequisites and the VA-API alternative are in [streaming.md](docs/streaming.md#in-docker):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build -d
+```
+
 After the first build, plain `docker compose up -d` is enough; `--build` is needed again only when source, Dockerfiles, or build args change — the rules (they apply to the GPU overlay too) are in [streaming.md](docs/streaming.md#in-docker).
 
 `restart: unless-stopped` on the worker service is what closes the daemon's deliberate no-respawn gap: a crashed worker container is restarted by Docker, says hello again, and the stream returns from passthrough to the AI branch — measured at ~365 ms of passthrough for a hard worker crash. To watch that failover happen:
