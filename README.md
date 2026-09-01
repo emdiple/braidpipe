@@ -6,6 +6,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-FF6D0E"></a>
+  <a href="https://pypi.org/project/braidpipe/"><img alt="PyPI" src="https://img.shields.io/pypi/v/braidpipe?color=FF6D0E&logo=pypi&logoColor=white"></a>
   <img alt="Rust 1.85+" src="https://img.shields.io/badge/rust-1.85%2B-FF6D0E?logo=rust&logoColor=white">
   <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-FF6D0E?logo=python&logoColor=white">
   <img alt="GStreamer 1.20+" src="https://img.shields.io/badge/gstreamer-1.20%2B-FF6D0E">
@@ -85,7 +86,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e python/ opencv-python
 ```
 
-That installs the `braidpipe` worker SDK (which brings numpy) plus OpenCV for the bundled examples.
+That installs the `braidpipe` worker SDK (which brings numpy) plus OpenCV for the bundled examples. Outside a checkout — a worker container, a remote machine, your own project — the SDK installs from [PyPI](https://pypi.org/project/braidpipe/): `pip install braidpipe`.
 
 The daemon prefers `.venv/bin/python3` when that path exists and otherwise falls back to `python3` on `PATH`, so a virtualenv at the repository root needs no extra configuration.
 
@@ -239,7 +240,6 @@ Each run writes a folder under `vmaf-test/runs/` with the capture, the per-frame
 - **Full-frame RGB only.** The alpha-overlay compositing path — where Python returns just a mask to be blended, instead of a whole frame — is not implemented yet.
 - **Frames are copied, not zero-copy, on the Rust side.** Each frame is copied out of the GStreamer buffer into shared memory and back. Python's view is genuinely zero-copy; Rust's is not.
 - **tcp-raw frames are uncompressed.** The remote-worker transport ships raw RGB, so it is LAN-only in practice; a compressed or subsampled wire format is not implemented yet (the config packet's `format` field exists so one can be negotiated later without breaking workers).
-- **The Python SDK is not on PyPI yet.** The `braidpipe` package in [python/](python/) wraps the whole worker loop (`braidpipe.run()`, both transports), the name is free, and [publish-pypi.yml](.github/workflows/publish-pypi.yml) publishes it on every `v*` tag — but the release flow still needs a maintainer to register the trusted publisher on pypi.org (the one-time setup is described at the top of that workflow). Until then, installing means `pip install python/` from a checkout.
 
 ## Contributing
 

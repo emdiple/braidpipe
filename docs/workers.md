@@ -16,7 +16,8 @@ The other side of the shared memory: the contract a worker implements, the bundl
 The `braidpipe` package in [python/](../python/) is the worker SDK: you write a function that mutates a frame, `braidpipe.run()` owns the loop — the handshake, the per-frame notification, the zero-copy NumPy view of the slot, freeing it, and the ack. Install it into whatever environment your worker runs in:
 
 ```bash
-pip install -e python/    # from the repository root; numpy is its only dependency
+pip install braidpipe     # from PyPI; numpy is its only dependency
+pip install -e python/    # or editable, from the repository root
 ```
 
 A complete worker:

@@ -6,6 +6,10 @@ package is how a Python process receives its frames — as zero-copy NumPy views
 over shared memory locally, or over the tcp-raw transport from another machine —
 and hands them back.
 
+```bash
+pip install braidpipe
+```
+
 A complete worker:
 
 ```python
