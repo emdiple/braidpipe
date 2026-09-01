@@ -21,28 +21,21 @@ Environment:
     BRAIDPIPE_PYTHON_SOCK   this worker's socket      (default: /tmp/braidpipe_python.sock)
 """
 
-import json
 import os
-import socket
-import sys
-import time
 
 import cv2
 import numpy as np
 
-# The transport layer lives in python/braidpipe/, a sibling of this examples/
-# directory; in the worker image everything is flattened into one directory,
-# where this insert resolves to nothing and the plain import already works.
-sys.path.insert(
-    0,
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python", "braidpipe"),
-)
-from remote import connect as remote_connect  # noqa: E402
-from shm import attach  # noqa: E402
+try:
+    import braidpipe
+except ModuleNotFoundError:  # run from a source checkout, package not installed
+    import sys
 
-DAEMON = os.environ.get("BRAIDPIPE_DAEMON")
-RUST_SOCK = os.environ.get("BRAIDPIPE_RUST_SOCK", "/tmp/braidpipe_rust.sock")
-PYTHON_SOCK = os.environ.get("BRAIDPIPE_PYTHON_SOCK", "/tmp/braidpipe_python.sock")
+    sys.path.insert(
+        0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python")
+    )
+    import braidpipe
+
 EDGE_LOW = int(os.environ.get("BRAIDPIPE_EDGE_LOW", "80"))
 EDGE_HIGH = int(os.environ.get("BRAIDPIPE_EDGE_HIGH", "180"))
 
@@ -68,98 +61,6 @@ def apply_edges(frame: np.ndarray) -> None:
     frame[:, split : split + 1] = (255, 109, 14)
 
 
-def run_worker(rust_sock_path: str, python_sock_path: str) -> None:
-    if os.path.exists(python_sock_path):
-        os.remove(python_sock_path)
-
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    sock.bind(python_sock_path)
-
-    # Handshake: the daemon answers our hello with the shared-memory fd.
-    shm = attach(sock, rust_sock_path)
-    print(
-        f"[edges] attached to SHM ({shm.width}x{shm.height} @ {shm.channels}ch), "
-        f"thresholds={EDGE_LOW}/{EDGE_HIGH}",
-        flush=True,
-    )
-
-    try:
-        while True:
-            packet = json.loads(sock.recvfrom(512)[0])
-            if "frame_id" not in packet:
-                continue  # a control packet, e.g. a duplicate handshake reply
-            frame_id = packet["frame_id"]
-            slot_idx = packet["slot_index"]
-            started = time.perf_counter_ns()
-
-            frame = shm.get_slot_numpy_array(slot_idx)
-
-            # Report the failure instead of dying: the relay passes the original
-            # frame through, and one good frame later the AI branch is back.
-            success = True
-            try:
-                apply_edges(frame)
-            except Exception as exc:
-                success = False
-                print(f"[edges] frame {frame_id} failed: {exc}", flush=True)
-
-            shm.mark_slot_free(slot_idx)
-
-            ack = {
-                "frame_id": frame_id,
-                "slot_index": slot_idx,
-                "processing_time_us": (time.perf_counter_ns() - started) // 1000,
-                "success": success,
-            }
-            try:
-                sock.sendto(json.dumps(ack).encode("utf-8"), rust_sock_path)
-            except OSError as exc:
-                # A full datagram buffer is backpressure, not a fatal error.
-                print(f"[edges] dropped ack for frame {frame_id}: {exc}", flush=True)
-
-    except KeyboardInterrupt:
-        print("[edges] shutting down cleanly...", flush=True)
-    finally:
-        sock.close()
-        if os.path.exists(python_sock_path):
-            os.remove(python_sock_path)
-
-
-def run_remote(daemon: str) -> None:
-    """The same worker over tcp-raw: frames arrive on a TCP connection instead
-    of a shared-memory slot, and sending the result back doubles as the ack."""
-    link = remote_connect(daemon)
-    print(
-        f"[edges] connected to daemon at {daemon} "
-        f"({link.width}x{link.height} @ {link.channels}ch), "
-        f"thresholds={EDGE_LOW}/{EDGE_HIGH}",
-        flush=True,
-    )
-    try:
-        for frame_id, slot_idx, _timestamp_us, frame in link.frames():
-            started = time.perf_counter_ns()
-            success = True
-            try:
-                apply_edges(frame)
-            except Exception as exc:
-                success = False
-                print(f"[edges] frame {frame_id} failed: {exc}", flush=True)
-            link.send_processed(
-                frame_id,
-                slot_idx,
-                frame,
-                (time.perf_counter_ns() - started) // 1000,
-                success,
-            )
-        print("[edges] daemon hung up", flush=True)
-    except KeyboardInterrupt:
-        print("[edges] shutting down cleanly...", flush=True)
-    finally:
-        link.close()
-
-
 if __name__ == "__main__":
-    if DAEMON:
-        run_remote(DAEMON)
-    else:
-        run_worker(RUST_SOCK, PYTHON_SOCK)
+    print(f"[edges] thresholds={EDGE_LOW}/{EDGE_HIGH}", flush=True)
+    braidpipe.run(apply_edges, name="edges")

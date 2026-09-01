@@ -1,19 +1,23 @@
 # syntax=docker/dockerfile:1
 # A Python worker image. Build context is the repository root.
 #
-# Flattens the generic layer (worker.py, shm.py, remote.py) and the example
-# workers into one directory, so every script finds its imports beside itself;
-# pick one with the compose service's `command:` (default: worker_edges.py).
-# worker_detect.py would additionally need `pip install ultralytics` and the
-# yolov8n.pt weights.
+# Installs the braidpipe worker SDK from python/ as a real package, then lays
+# the example workers in /app; pick one with the compose service's `command:`
+# (default: worker_edges.py). worker_detect.py would additionally need
+# `pip install ultralytics` and the yolov8n.pt weights.
 
 FROM python:3.12-slim
 # On networks where pypi.org is unreachable, point this at a full mirror, e.g.
 #   PIP_INDEX_URL=https://mirror-pypi.runflare.com/simple docker compose up --build
 ARG PIP_INDEX_URL=https://pypi.org/simple
-RUN pip install --no-cache-dir --index-url "$PIP_INDEX_URL" numpy opencv-python-headless
+# As an ENV, the mirror also covers the isolated build env pip creates while
+# packaging the SDK below.
+ENV PIP_INDEX_URL=$PIP_INDEX_URL
+RUN pip install --no-cache-dir numpy opencv-python-headless
+COPY python/ /opt/braidpipe-python/
+RUN pip install --no-cache-dir --no-deps /opt/braidpipe-python \
+    && rm -rf /opt/braidpipe-python
 WORKDIR /app
-COPY python/braidpipe/ ./
 COPY examples/ ./
 ENTRYPOINT ["python3", "-u"]
 CMD ["worker_edges.py"]

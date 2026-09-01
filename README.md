@@ -82,8 +82,10 @@ cd braidpipe
 cargo build --release
 
 python3 -m venv .venv
-.venv/bin/pip install numpy opencv-python
+.venv/bin/pip install -e python/ opencv-python
 ```
+
+That installs the `braidpipe` worker SDK (which brings numpy) plus OpenCV for the bundled examples.
 
 The daemon prefers `.venv/bin/python3` when that path exists and otherwise falls back to `python3` on `PATH`, so a virtualenv at the repository root needs no extra configuration.
 
@@ -165,22 +167,19 @@ Full reference, GPU flags, environment overrides and per-source recipes: [Stream
 
 ## Writing a worker
 
-A worker is a loop over one Unix datagram socket: say hello, get the shared-memory fd back, then for each notification mutate a zero-copy NumPy view of the slot in place and ack it.
+A worker is a function that mutates a frame; the `braidpipe` Python package ([python/](python/)) runs the loop around it — handshake, per-frame notification, zero-copy NumPy view of the slot, slot release, ack.
 
 ```python
-shm = attach(sock, "/tmp/braidpipe_rust.sock")        # handshake
+import braidpipe
 
-while True:
-    packet = json.loads(sock.recvfrom(512)[0])
-    frame = shm.get_slot_numpy_array(packet["slot_index"])   # (H, W, 3) uint8, RGB
+def process(frame):          # (H, W, 3) uint8, RGB — mutate it in place
+    frame[:, :, 0] //= 2     # your inference here
 
-    # ... your inference here; mutate `frame` in place ...
-
-    shm.mark_slot_free(packet["slot_index"])
-    sock.sendto(ack(packet, success=True), "/tmp/braidpipe_rust.sock")
+if __name__ == "__main__":
+    braidpipe.run(process)
 ```
 
-Finish inside 1.5 frame periods, always free the slot, always ack (`"success": false` on failure is correct and safe), and remember frames are RGB, not BGR. [python/braidpipe/worker.py](python/braidpipe/worker.py) is that contract with an empty `process()` hook — copy it and fill the hook in. Three worked examples ship in [examples/](examples/) — edge transform, threaded YOLO detection, and clock stamping — and the contract is language-agnostic: [worker.rs](crates/braidpipe-ipc/examples/worker.rs) is the same worker in Rust.
+Finish inside 1.5 frame periods and remember frames are RGB, not BGR; everything else — freeing the slot, acking, reporting an exception as `"success": false` so the stream falls back to passthrough instead of dying — is `run()`'s job. Take a second `ctx` parameter for frame ids and timestamps, and use `braidpipe.BackgroundModel` for models too slow for the deadline. [python/braidpipe/worker.py](python/braidpipe/worker.py) is this as a template with an empty `process()` hook; three worked examples ship in [examples/](examples/) — edge transform, threaded YOLO detection, and clock stamping. The contract underneath is language-agnostic: [worker.rs](crates/braidpipe-ipc/examples/worker.rs) is the same worker in Rust, on the raw protocol.
 
 Workers do not have to be launched by the daemon. `--external-worker` attaches a process you own (a container, a service, something started by hand), and `--worker-listen` accepts workers from other machines over the tcp-raw transport. Full contract and every attach mode: [AI workers](docs/workers.md).
 
@@ -204,7 +203,7 @@ Ports and adapters, so the availability logic can be tested without GStreamer or
 | [crates/braidpipe-engine/](crates/braidpipe-engine/) | GStreamer adapter: pipeline construction, branch switching, bus error reporting, and the macOS run-loop wrapper. |
 | [crates/braidpipe-ipc/](crates/braidpipe-ipc/) | The shared-memory ring buffer, the Unix-datagram control bridge with its health tracking, and the tcp-raw network transport, plus [examples/worker.rs](crates/braidpipe-ipc/examples/worker.rs) — a worker written in Rust. |
 | [crates/braidpipe/](crates/braidpipe/) | The daemon: CLI, wiring, worker supervision, [preset.rs](crates/braidpipe/src/preset.rs) — the latency/bandwidth profiles — and [relay.rs](crates/braidpipe/src/relay.rs) — the appsink → shm → Python → appsrc data path. |
-| [python/braidpipe/](python/braidpipe/) | The generic worker layer: `worker.py` (the raw template with an empty `process()` hook), `shm.py` (the Rust layout mirror), and `remote.py` (the tcp-raw client). |
+| [python/](python/) | The `braidpipe` worker SDK, pip-installable: `runner.py` (the `run()` loop over both transports), `background.py` (off-hot-path inference), `shm.py` (the Rust layout mirror), `remote.py` (the tcp-raw client), `worker.py` (the raw template with an empty `process()` hook), and `tests/` (SDK tests against a fake daemon — `python3 -m unittest discover python/tests`). |
 | [examples/](examples/) | The demonstration workers — edge transform, threaded YOLO detection, clock stamping — plus `stamp.py`, the latency barcode they share with the probe. |
 | [docs/](docs/) | The detailed guides linked above. |
 | [scripts/](scripts/) | Manual end-to-end checks, the latency harness, and the per-preset bandwidth measurement. |
@@ -239,7 +238,7 @@ Each run writes a folder under `vmaf-test/runs/` with the capture, the per-frame
 - **Full-frame RGB only.** The alpha-overlay compositing path — where Python returns just a mask to be blended, instead of a whole frame — is not implemented yet.
 - **Frames are copied, not zero-copy, on the Rust side.** Each frame is copied out of the GStreamer buffer into shared memory and back. Python's view is genuinely zero-copy; Rust's is not.
 - **tcp-raw frames are uncompressed.** The remote-worker transport ships raw RGB, so it is LAN-only in practice; a compressed or subsampled wire format is not implemented yet (the config packet's `format` field exists so one can be negotiated later without breaking workers).
-- **No Python SDK.** `shm.py` and `remote.py` mirror the two transports and nothing more: they are not packaged, not on PyPI, and have no importable name. Every worker re-implements the same socket loop, slot release, and ack handling by copying an example. A thin `braidpipe` package wrapping that loop would remove the copy-paste, and is the obvious next piece of work.
+- **The Python SDK is not on PyPI yet.** The `braidpipe` package in [python/](python/) wraps the whole worker loop (`braidpipe.run()`, both transports), but installing it still means `pip install python/` from a checkout. Publishing to PyPI — and a version field in the handshake so a mismatched daemon/SDK pair fails loudly — is the next piece of work.
 
 ## Contributing
 

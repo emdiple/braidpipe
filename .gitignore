@@ -25,6 +25,11 @@ __pycache__/
 .venv/
 venv/
 
+# Python packaging artifacts (pip install -e python/, wheel builds)
+*.egg-info/
+/python/build/
+/python/dist/
+
 # macOS finder metadata
 .DS_Store
 

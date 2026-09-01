@@ -5,9 +5,9 @@ wall clock of the moment the worker touched it printed across the top row, so a
 receiver on the far end of the encoder and the network can subtract that from
 its own clock and get the real one-way latency of everything in between.
 
-It also reports the leg it can see for itself: the daemon stamps each shared
-memory slot with the time it wrote the frame, so the gap between that and the
-worker waking up is the SHM + UDS delivery cost.
+It also reports the leg it can see for itself: the daemon stamps each frame
+with the time it handed it over (`ctx.timestamp_us`), so the gap between that
+and the worker waking up is the IPC delivery cost.
 
 Used by scripts/rtmp-latency.sh, but it works against any sink.
 
@@ -21,24 +21,22 @@ Environment:
     BRAIDPIPE_PYTHON_SOCK     this worker's socket       (default: /tmp/braidpipe_python.sock)
 """
 
-import json
 import os
-import socket
 import sys
 import time
 
-# The transport layer lives in python/braidpipe/, a sibling of this examples/
-# directory; in the worker image everything is flattened into one directory,
-# where this insert resolves to nothing and the plain import already works.
-sys.path.insert(
-    0,
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python", "braidpipe"),
-)
-from shm import attach  # noqa: E402
-from stamp import encode  # noqa: E402
+import numpy as np
 
-RUST_SOCK = os.environ.get("BRAIDPIPE_RUST_SOCK", "/tmp/braidpipe_rust.sock")
-PYTHON_SOCK = os.environ.get("BRAIDPIPE_PYTHON_SOCK", "/tmp/braidpipe_python.sock")
+try:
+    import braidpipe
+except ModuleNotFoundError:  # run from a source checkout, package not installed
+    sys.path.insert(
+        0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python")
+    )
+    import braidpipe
+
+from stamp import encode
+
 BUSY_MS = float(os.environ.get("BRAIDPIPE_STAMP_BUSY_MS", "0"))
 REPORT_EVERY = int(os.environ.get("BRAIDPIPE_STAMP_REPORT", "150"))
 
@@ -67,76 +65,25 @@ def burn(milliseconds: float) -> None:
         pass
 
 
-def run_worker(rust_sock_path: str, python_sock_path: str) -> None:
-    if os.path.exists(python_sock_path):
-        os.remove(python_sock_path)
+ipc_ms: list[float] = []
 
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    sock.bind(python_sock_path)
 
-    # Handshake: the daemon answers our hello with the shared-memory fd.
-    shm = attach(sock, rust_sock_path)
-    print(
-        f"[stamp] attached to SHM ({shm.width}x{shm.height} @ {shm.channels}ch), "
-        f"busy={BUSY_MS}ms",
-        flush=True,
-    )
+def process(frame: np.ndarray, ctx: braidpipe.FrameContext) -> None:
+    now_us = time.time_ns() // 1000
+    ipc_ms.append((now_us - ctx.timestamp_us) / 1000.0)
 
-    ipc_ms: list[float] = []
+    if BUSY_MS:
+        burn(BUSY_MS)
+    # Stamped last, so the barcode carries the moment the frame was actually
+    # handed back rather than the moment work began.
+    encode(frame, time.time_ns() // 1000)
 
-    try:
-        while True:
-            packet = json.loads(sock.recvfrom(512)[0])
-            if "frame_id" not in packet:
-                continue  # a control packet, e.g. a duplicate handshake reply
-            frame_id = packet["frame_id"]
-            slot_idx = packet["slot_index"]
-            started = time.perf_counter_ns()
-
-            # Read the daemon's write time before freeing the slot, or the next
-            # frame may already have overwritten the header.
-            _, _, written_us = shm.read_slot_header(slot_idx)
-            now_us = time.time_ns() // 1000
-            ipc_ms.append((now_us - written_us) / 1000.0)
-
-            frame = shm.get_slot_numpy_array(slot_idx)
-
-            success = True
-            try:
-                if BUSY_MS:
-                    burn(BUSY_MS)
-                # Stamped last, so the barcode carries the moment the frame was
-                # actually handed back rather than the moment work began.
-                encode(frame, time.time_ns() // 1000)
-            except Exception as exc:
-                success = False
-                print(f"[stamp] frame {frame_id} failed: {exc}", flush=True)
-
-            shm.mark_slot_free(slot_idx)
-
-            ack = {
-                "frame_id": frame_id,
-                "slot_index": slot_idx,
-                "processing_time_us": (time.perf_counter_ns() - started) // 1000,
-                "success": success,
-            }
-            try:
-                sock.sendto(json.dumps(ack).encode("utf-8"), rust_sock_path)
-            except OSError as exc:
-                print(f"[stamp] dropped ack for frame {frame_id}: {exc}", flush=True)
-
-            if REPORT_EVERY and len(ipc_ms) % REPORT_EVERY == 0:
-                print(f"[stamp] daemon->worker  {percentiles(ipc_ms)}", flush=True)
-
-    except KeyboardInterrupt:
-        pass
-    finally:
-        if ipc_ms:
-            print(f"[stamp] FINAL daemon->worker  {percentiles(ipc_ms)}", flush=True)
-        sock.close()
-        if os.path.exists(python_sock_path):
-            os.remove(python_sock_path)
+    if REPORT_EVERY and len(ipc_ms) % REPORT_EVERY == 0:
+        print(f"[stamp] daemon->worker  {percentiles(ipc_ms)}", flush=True)
 
 
 if __name__ == "__main__":
-    run_worker(RUST_SOCK, PYTHON_SOCK)
+    print(f"[stamp] busy={BUSY_MS}ms", flush=True)
+    braidpipe.run(process, name="stamp")
+    if ipc_ms:
+        print(f"[stamp] FINAL daemon->worker  {percentiles(ipc_ms)}", flush=True)
