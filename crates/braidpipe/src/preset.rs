@@ -289,9 +289,15 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
                 p.speed_preset, p.bitrate_kbps, p.vbv_buf_ms
             )
         }
+        // CBR is what makes the bitrate number mean something on VideoToolbox:
+        // its default ABR undershoots easy content (encoding at an internal
+        // ~0.5 quality point with the budget left unspent) and bursts far past
+        // the target on hard scenes with no VBV to bound it. Constant bitrate
+        // does both of the jobs x264's VBV does. The quality knob only applies
+        // if rate control is ever ABR again; under CBR VideoToolbox ignores it.
         Encoder::Vtenc => format!(
             "vtenc_h264 realtime={} allow-frame-reordering={} bitrate={} \
-             max-keyframe-interval={keyint}",
+             max-keyframe-interval={keyint} rate-control=cbr quality=0.65",
             p.zerolatency, !p.zerolatency, p.bitrate_kbps
         ),
         // The hardware encoders below all take kbps like x264, but each has
@@ -547,6 +553,12 @@ mod tests {
         };
 
         // lowlatency: 4500 kbps, 2s GOP at 30fps = 60, 200ms VBV = 900 kbit.
+        let vtenc = with_encoder("vtenc");
+        assert!(vtenc.contains(
+            "vtenc_h264 realtime=true allow-frame-reordering=false bitrate=4500 \
+             max-keyframe-interval=60 rate-control=cbr quality=0.65"
+        ));
+
         let nvenc = with_encoder("nvenc");
         assert!(nvenc.contains(
             "nvh264enc bitrate=4500 gop-size=60 rc-mode=cbr preset=low-latency-hq \
