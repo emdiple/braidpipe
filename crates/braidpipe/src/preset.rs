@@ -304,12 +304,23 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
         // its own name for the GOP and its own shape of low-latency switch.
         // The VBV bound carries over where the encoder exposes one (NVENC's
         // vbv-buffer-size, VA's cpb-size, both in kbit).
+        // cbr-ld-hq is the low-delay high-quality flavor of CBR and
+        // zerolatency=true removes the reordering delay outright; b-adapt and
+        // bframes only restate their defaults, but this tuning depends on
+        // them, so they are pinned. The caps keep the encoder from quietly
+        // negotiating down from high profile, which every NVENC supports.
         Encoder::Nvenc => format!(
-            "nvh264enc bitrate={} gop-size={keyint} rc-mode=cbr preset={} \
-             vbv-buffer-size={}",
+            "nvh264enc bitrate={} gop-size={keyint} rc-mode={} preset={} \
+             vbv-buffer-size={}{} ! video/x-h264,profile=high",
             p.bitrate_kbps,
+            if p.zerolatency { "cbr-ld-hq" } else { "cbr" },
             if p.zerolatency { "low-latency-hq" } else { "hq" },
-            p.bitrate_kbps * p.vbv_buf_ms / 1000
+            p.bitrate_kbps * p.vbv_buf_ms / 1000,
+            if p.zerolatency {
+                " b-adapt=false bframes=0 zerolatency=true"
+            } else {
+                ""
+            }
         ),
         Encoder::Va => format!(
             "vah264enc bitrate={} key-int-max={keyint} target-usage={} cpb-size={}",
@@ -364,11 +375,14 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
         ));
     };
 
-    // I420 pinned before the encoder: left to caps negotiation from the RGB
-    // the AI branch deals in, videoconvert offers 4:4:4 -- twice the samples
-    // for no benefit over these transports.
+    // A 4:2:0 format pinned before the encoder: left to caps negotiation from
+    // the RGB the AI branch deals in, videoconvert offers 4:4:4 -- twice the
+    // samples for no benefit over these transports. x264 gets its native
+    // planar I420; the hardware encoders are NV12-native (biplanar), which
+    // spares them an internal repack per frame. Same chroma either way.
+    let raw_format = if p.encoder == Encoder::X264 { "I420" } else { "NV12" };
     Ok(format!(
-        "videoconvert ! video/x-raw,format=I420 ! {encoder} ! \
+        "videoconvert ! video/x-raw,format={raw_format} ! {encoder} ! \
          h264parse config-interval=-1 ! {mux_and_sink}"
     ))
 }
@@ -561,9 +575,11 @@ mod tests {
 
         let nvenc = with_encoder("nvenc");
         assert!(nvenc.contains(
-            "nvh264enc bitrate=4500 gop-size=60 rc-mode=cbr preset=low-latency-hq \
-             vbv-buffer-size=900"
+            "nvh264enc bitrate=4500 gop-size=60 rc-mode=cbr-ld-hq preset=low-latency-hq \
+             vbv-buffer-size=900 b-adapt=false bframes=0 zerolatency=true ! \
+             video/x-h264,profile=high"
         ));
+        assert!(nvenc.contains("video/x-raw,format=NV12"));
 
         let va = with_encoder("va");
         assert!(va.contains("vah264enc bitrate=4500 key-int-max=60 target-usage=6 cpb-size=900"));
