@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "braidpipe"
-version = "0.2.0"
+version = "0.3.0"
 description = "Worker SDK for braidpipe, the never-dark AI video middleware: write a function that mutates a frame, the SDK runs the IPC loop."
 readme = "README.md"
 requires-python = ">=3.10"
