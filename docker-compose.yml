@@ -1,6 +1,7 @@
 # braidpipe + an external Python worker, talking over a shared socket volume.
 #
 #   docker compose up --build
+#   # ...publish an SRT feed (caller mode) to :8890, then...
 #   ffplay 'srt://127.0.0.1:8891?latency=200'      # watch the output
 #
 # The shared-memory segment is anonymous: its fd crosses the container
@@ -30,13 +31,14 @@ services:
       - --width=1920
       - --height=1080
       - --fps=50
-      # SRT in and out. The input dials an SRT source on the host (e.g. a
-      # MediaMTX/OBS listener on 8890) -- host.docker.internal is 127.0.0.1
-      # seen from inside the container. The output listens on 8891; watch it
-      # with `ffplay 'srt://127.0.0.1:8891?latency=200'`. The pipeline runs
-      # with or without a viewer -- output packets just drop until one
+      # SRT in and out. The input listens on 8890 for a publisher: point the
+      # sender (OBS/ffmpeg/vMix push in caller mode by default) at
+      # srt://<server>:8890?latency=200 -- two callers never handshake, so a
+      # pushed feed needs this side to listen. The output listens on 8891;
+      # watch it with `ffplay 'srt://<server>:8891?latency=200'`. The pipeline
+      # runs with or without a viewer -- output packets just drop until one
       # connects (BRAIDPIPE_SRT_WAIT_FOR_CONNECTION=1 restores blocking).
-      - --uri=srt://host.docker.internal:8890?mode=caller&latency=200
+      - --uri=srt://0.0.0.0:8890?mode=listener&latency=200
       - --output=srt://0.0.0.0:8891?mode=listener&latency=200
       # Embedded audio is carried through (decoded, re-encoded to AAC, muxed).
       - --audio
@@ -44,8 +46,9 @@ services:
       # - --output=rtmp://my-server/live/stream
       # - --output=udp://host.docker.internal:9720   (never blocks on a viewer;
       #   watch with `ffplay udp://127.0.0.1:9720`)
-      # - --uri=srt://0.0.0.0:9000?mode=listener   (accept a publisher instead
-      #   of dialing one; publish 9000/udp)
+      # - --uri=srt://host.docker.internal:8890?mode=caller   (dial a source
+      #   that itself listens on the host, e.g. MediaMTX or an OBS listener;
+      #   extra_hosts below makes the name resolve on Linux too)
       # Drop --uri (and --audio) to fall back to the built-in test pattern.
     environment:
       # lowlatency's 4500 kbps default assumes 720p30. When bandwidth is free,
@@ -67,6 +70,7 @@ services:
     volumes:
       - sockets:/sockets
     ports:
+      - "8890:8890/udp"   # SRT input listener (publish the feed here)
       - "8891:8891/udp"   # SRT output listener (SRT rides on UDP)
       - "9185:9185"       # metrics, only live with --profile metrics
     restart: unless-stopped

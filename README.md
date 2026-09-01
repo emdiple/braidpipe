@@ -113,11 +113,12 @@ kill -9 <pid from the "Python worker active pid=…" log line>
 The repo ships a compose stack that runs the daemon and a worker as separate containers, sharing only a socket volume — the shared memory itself is anonymous, so its fd crosses the container boundary inside the daemon's socket reply, with no `/dev/shm` mount and no `ipc: host`:
 
 ```bash
-# the daemon dials an SRT source on the host's :8890 -- OBS, MediaMTX, or a test feed:
-gst-launch-1.0 videotestsrc is-live=true ! x264enc tune=zerolatency \
-    ! mpegtsmux ! srtsink uri='srt://0.0.0.0:8890?mode=listener'
-
 docker compose up --build
+
+# the daemon listens on :8890 -- publish to it from OBS, ffmpeg, or a test feed:
+gst-launch-1.0 videotestsrc is-live=true ! x264enc tune=zerolatency \
+    ! mpegtsmux ! srtsink uri='srt://127.0.0.1:8890?mode=caller'
+
 ffplay -fflags nobuffer 'srt://127.0.0.1:8891?latency=200'   # the edge-transformed feed
 ```
 
