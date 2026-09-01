@@ -202,6 +202,7 @@ Ports and adapters, so the availability logic can be tested without GStreamer or
 | [examples/](examples/) | The demonstration workers — edge transform, threaded YOLO detection, clock stamping — plus `stamp.py`, the latency barcode they share with the probe. |
 | [docs/](docs/) | The detailed guides linked above. |
 | [scripts/](scripts/) | Manual end-to-end checks, the latency harness, and the per-preset bandwidth measurement. |
+| [vmaf-test/](vmaf-test/) | VMAF quality measurement of the encode path over SRT — see [its README](vmaf-test/README.md). |
 | [monitoring/](monitoring/) | Prometheus + Grafana compose stack: scrape config, alert rules, provisioned dashboard. |
 | [assets/](assets/) | Logo files: transparent wordmark and icon PNGs, plus a multi-size `.ico`. |
 
