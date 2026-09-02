@@ -307,10 +307,15 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
         // cbr-ld-hq is the low-delay high-quality flavor of CBR and
         // zerolatency=true removes the reordering delay outright; b-adapt and
         // bframes only restate their defaults, but this tuning depends on
-        // them, so they are pinned. The caps keep the encoder from quietly
-        // negotiating down from high profile, which every NVENC supports.
+        // them, so they are pinned. spatial-aq shifts bits into detailed
+        // regions and weighted-pred fixes fades; both cost only encoder
+        // throughput, never delay -- unlike rc-lookahead/temporal-aq, which
+        // buy quality with N frames of latency and so stay off. The caps keep
+        // the encoder from quietly negotiating down from high profile, which
+        // every NVENC supports.
         Encoder::Nvenc => format!(
             "nvh264enc bitrate={} gop-size={keyint} rc-mode={} preset={} \
+             spatial-aq=true aq-strength=8 weighted-pred=true \
              vbv-buffer-size={}{} ! video/x-h264,profile=high",
             p.bitrate_kbps,
             if p.zerolatency { "cbr-ld-hq" } else { "cbr" },
@@ -585,6 +590,7 @@ mod tests {
         let nvenc = with_encoder("nvenc");
         assert!(nvenc.contains(
             "nvh264enc bitrate=4500 gop-size=60 rc-mode=cbr-ld-hq preset=low-latency-hq \
+             spatial-aq=true aq-strength=8 weighted-pred=true \
              vbv-buffer-size=900 b-adapt=false bframes=0 zerolatency=true ! \
              video/x-h264,profile=high"
         ));
