@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """End-to-end VMAF test for braidpipe's encoder path.
 
-Streams a source file into a passthrough-only braidpipe daemon over SRT,
-captures the SRT output, scores it against the source with libvmaf, and
-writes a per-run folder with the capture, raw scores, daemon log, and a
-markdown report.
+Streams a source into a passthrough-only braidpipe daemon, captures the SRT
+output, scores it against the reference with libvmaf, and writes a per-run
+folder with the capture, raw scores, daemon log, and a markdown report.
 
 Usage:
     python3 run_vmaf_test.py yoursource.mp4
-    python3 run_vmaf_test.py yoursource.mp4 --duration 40 -- --fps 50 --width 1920 --height 1080
+    python3 run_vmaf_test.py yoursource.mp4 --feed 127.0.0.1:8890
+    python3 run_vmaf_test.py --uri 'http://host:8000/play/ch1' --duration 60
 
 Requires: ffmpeg/ffprobe with libvmaf, and a built braidpipe binary.
 """
@@ -16,6 +16,7 @@ Requires: ffmpeg/ffprobe with libvmaf, and a built braidpipe binary.
 import argparse
 import json
 import os
+from collections import Counter
 import signal
 import statistics
 import subprocess
@@ -34,13 +35,21 @@ OUT_PORT = 8891
 # truncation (the tail no longer lines up), not encoder behavior.
 BROKEN_TAIL_THRESHOLD = 20.0
 
+# Alignment probes: distorted frames matched against the reference by pixel
+# difference. A match is trusted when a majority of probes imply the same
+# frame offset - encoder distortion moves the absolute difference floor
+# around, but only the true offset wins consistently.
+ALIGN_PROBES = (10, 30, 50, 70, 90)
+
 
 def probe(path: Path, entries: str) -> str:
+    # An MPEG-TS capture can list the same stream under two program entries;
+    # keep the first line only.
     return subprocess.check_output(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", entries, "-of", "csv=p=0", str(path)],
         text=True,
-    ).strip()
+    ).strip().splitlines()[0]
 
 
 def probe_fps(path: Path) -> float:
@@ -104,6 +113,23 @@ def wait_capture_drained(path: Path, daemon: subprocess.Popen, log: Path,
     raise RuntimeError(f"capture never went quiet within {timeout:.0f}s")
 
 
+def wait_or_fail(proc: subprocess.Popen, timeout: float, what: str,
+                 log: Path) -> None:
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"{what} did not finish within {timeout:.0f}s; daemon log tail:\n"
+            + "\n".join(log.read_text().splitlines()[-10:])
+        ) from None
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"{what} failed (ffmpeg exit code {proc.returncode}); "
+            "daemon log tail:\n"
+            + "\n".join(log.read_text().splitlines()[-10:])
+        )
+
+
 def stop_process(proc: subprocess.Popen | None, sig: int = signal.SIGINT,
                  timeout: float = 10.0) -> None:
     """Signals a process and escalates to SIGKILL if it does not exit."""
@@ -115,6 +141,48 @@ def stop_process(proc: subprocess.Popen | None, sig: int = signal.SIGINT,
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+
+
+def gray_frames(path: Path, count: int) -> list[bytes]:
+    """Decodes the first `count` frames as 64x36 grayscale thumbnails."""
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(path), "-frames:v", str(count),
+         "-vf", "scale=64:36", "-pix_fmt", "gray", "-f", "rawvideo", "-"],
+        capture_output=True, check=True,
+    ).stdout
+    size = 64 * 36
+    return [raw[i * size:(i + 1) * size] for i in range(len(raw) // size)]
+
+
+def mean_abs_diff(a: bytes, b: bytes) -> float:
+    return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
+
+
+def find_alignment(distorted: Path, reference: Path,
+                   window: int = 600) -> tuple[int, int]:
+    """Returns (distorted_start, reference_start): the frame indices at which
+    the two captures show the same content. Needed when both sides recorded a
+    live stream and connected at slightly different moments."""
+    dist = gray_frames(distorted, max(ALIGN_PROBES) + 10)
+    refs = gray_frames(reference, window)
+    probes = [k for k in ALIGN_PROBES if k < len(dist)]
+    if not probes or len(refs) < 30:
+        raise RuntimeError("captures too short to align")
+
+    offsets = []
+    for k in probes:
+        _, j = min((mean_abs_diff(dist[k], r), j) for j, r in enumerate(refs))
+        offsets.append(j - k)
+    offset, votes = Counter(offsets).most_common(1)[0]
+    if votes * 2 <= len(probes):
+        raise RuntimeError(
+            f"could not align the captures (probe offsets disagree: {offsets}); "
+            "are both recording the same stream?"
+        )
+    # The first captured frames of a mid-GOP join decode as garbage, so never
+    # start the comparison right at frame 0.
+    dist_start = max(10, -offset)
+    return dist_start, dist_start + offset
 
 
 def pool(scores: list[float]) -> dict:
@@ -139,7 +207,8 @@ def verdict(mean: float) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("source", type=Path, help="reference video file")
+    ap.add_argument("source", type=Path, nargs="?", default=None,
+                    help="reference video file (omit when using --uri)")
     ap.add_argument("--preset", default="lowlatency", help="braidpipe output preset")
     ap.add_argument("--latency", type=int, default=200,
                     help="SRT latency budget in ms, applied to both the "
@@ -149,8 +218,15 @@ def main() -> int:
                          "input instead of streaming the source file; the source "
                          "argument is still the VMAF reference and must be the same "
                          "content the feed sends")
+    ap.add_argument("--uri", default=None,
+                    help="arbitrary daemon input URI (http://, udp://, rtp://, ...). "
+                         "The incoming stream is recorded and used as the VMAF "
+                         "reference, so no source file is given; requires --duration. "
+                         "The server must accept two simultaneous clients (the daemon "
+                         "and the recorder) - for an SRT listener input use --feed")
     ap.add_argument("--duration", type=float, default=None,
-                    help="only stream/score the first N seconds of the source")
+                    help="seconds to stream/score (required with --uri; otherwise "
+                         "defaults to the whole source file)")
     ap.add_argument("--workdir", type=Path, default=Path(__file__).resolve().parent,
                     help="runs are created under <workdir>/runs/")
     ap.epilog = ("everything after a standalone -- is passed to the braidpipe "
@@ -162,13 +238,26 @@ def main() -> int:
         split = argv.index("--")
         argv, extras = argv[:split], argv[split + 1:]
     args = ap.parse_args(argv)
+
     owned = {"--uri", "--source", "--output", "--passthrough-only"} & set(extras)
     if owned:
         sys.exit(f"the test script owns {', '.join(sorted(owned))} - it must control "
-                 "the SRT ports and keep the worker out of the path")
+                 "the input/output wiring and keep the worker out of the path")
 
-    if not args.source.is_file():
-        sys.exit(f"source not found: {args.source}")
+    if args.uri and args.feed:
+        sys.exit("--uri and --feed are mutually exclusive")
+    if args.uri:
+        if args.source:
+            sys.exit("--uri records its own reference from the stream; "
+                     "drop the source file argument")
+        if not args.duration:
+            sys.exit("--uri input is treated as live; say how long to record "
+                     "with --duration N")
+    else:
+        if not args.source:
+            sys.exit("a source file is required (or use --uri)")
+        if not args.source.is_file():
+            sys.exit(f"source not found: {args.source}")
     if not DAEMON_BIN.is_file():
         sys.exit(f"daemon binary not found: {DAEMON_BIN} (run: cargo build --release)")
     if args.feed:
@@ -182,7 +271,12 @@ def main() -> int:
                 sys.exit(f"nothing is listening on UDP port {port} - start your "
                          "SRT feed first (it must be an SRT listener)")
 
-    preset = extras[extras.index("--preset") + 1] if "--preset" in extras else args.preset
+    preset = args.preset
+    for i, flag in enumerate(extras):
+        if flag == "--preset":
+            preset = extras[i + 1]
+        elif flag.startswith("--preset="):
+            preset = flag.split("=", 1)[1]
     started_at = datetime.now()
     run_dir = args.workdir / "runs" / f"{started_at:%Y%m%d-%H%M%S}-{preset}"
     run_dir.mkdir(parents=True)
@@ -190,20 +284,23 @@ def main() -> int:
     vmaf_json = run_dir / "vmaf.json"
     daemon_log = run_dir / "daemon.log"
     report_md = run_dir / "report.md"
+    reference = run_dir / "reference.ts" if args.uri else args.source
 
     duration = args.duration or float(probe(args.source, "format=duration"))
     env_vars = {k: v for k, v in sorted(os.environ.items()) if k.startswith("BRAIDPIPE_")}
 
-    daemon = capture = None
+    daemon = capture = recorder = None
     try:
-        if args.feed:
+        if args.uri:
+            in_uri = args.uri
+        elif args.feed:
             in_uri = f"srt://{args.feed}?mode=caller&latency={args.latency}"
         else:
             in_uri = f"srt://0.0.0.0:{IN_PORT}?mode=listener&latency={args.latency}"
         daemon_cmd = [str(DAEMON_BIN), "--passthrough-only",
                       "--uri", in_uri,
                       "--output", f"srt://0.0.0.0:{OUT_PORT}?mode=listener&latency={args.latency}"]
-        if "--preset" not in extras:
+        if preset == args.preset and "--preset" not in " ".join(extras):
             daemon_cmd += ["--preset", args.preset]
         daemon_cmd += extras
         print(f"[1/5] starting daemon: {' '.join(daemon_cmd[1:])}")
@@ -214,16 +311,31 @@ def main() -> int:
             )
         wait_for_udp_port(OUT_PORT, daemon, daemon_log)
 
-        print(f"[2/5] capturing output to {distorted.relative_to(args.workdir)}")
-        capture = subprocess.Popen(
-            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-             "-i", f"srt://127.0.0.1:{OUT_PORT}?mode=caller&latency={args.latency}",
-             "-c", "copy", str(distorted)],
-        )
+        if args.uri:
+            print(f"[2/5] recording the input stream as reference "
+                  f"({duration:.0f}s) and capturing the output")
+            recorder = subprocess.Popen(
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                 "-i", args.uri, "-c", "copy", "-t", str(duration),
+                 "-f", "mpegts", str(reference)],
+            )
+        else:
+            print(f"[2/5] capturing output to {distorted.relative_to(args.workdir)}")
+        capture_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                       "-i", f"srt://127.0.0.1:{OUT_PORT}?mode=caller&latency={args.latency}",
+                       "-c", "copy"]
+        if args.uri:
+            capture_cmd += ["-t", str(duration)]
+        capture = subprocess.Popen(capture_cmd + [str(distorted)])
 
-        if args.feed:
+        if args.uri:
+            print(f"[3/5] recording from {args.uri} for {duration:.0f}s")
+            wait_or_fail(capture, duration + 60, "the output capture", daemon_log)
+            wait_or_fail(recorder, duration + 60, "the reference recorder", daemon_log)
+        elif args.feed:
             print(f"[3/5] using external feed at {args.feed}; "
                   f"waiting for the stream to end (~{duration:.0f}s)")
+            wait_capture_drained(distorted, daemon, daemon_log, timeout=duration + 60)
         else:
             print(f"[3/5] streaming {args.source.name} ({duration:.1f}s at real-time speed)")
             feed_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-re"]
@@ -232,20 +344,41 @@ def main() -> int:
             feed_cmd += ["-i", str(args.source), "-c", "copy", "-f", "mpegts",
                          f"srt://127.0.0.1:{IN_PORT}?mode=caller&latency={args.latency}"]
             subprocess.run(feed_cmd, check=True)
+            wait_capture_drained(distorted, daemon, daemon_log, timeout=duration + 60)
 
-        wait_capture_drained(distorted, daemon, daemon_log, timeout=duration + 60)
         stop_process(capture, signal.SIGINT)
+        stop_process(recorder, signal.SIGINT)
         stop_process(daemon, signal.SIGTERM)
 
+        for path, what in ((distorted, "output capture"),
+                           (reference, "reference recording")):
+            if not path.is_file() or path.stat().st_size == 0:
+                raise RuntimeError(
+                    f"the {what} is empty - the stream never reached it; "
+                    "daemon log tail:\n"
+                    + "\n".join(daemon_log.read_text().splitlines()[-10:])
+                )
         captured_frames = count_frames(distorted)
-        expected_frames = round(duration * probe_fps(args.source))
-        print(f"[4/5] captured {captured_frames}/{expected_frames} frames; scoring with libvmaf")
+        expected_frames = round(duration * probe_fps(reference))
+        if args.uri:
+            ref_frames = count_frames(reference)
+            out_start, ref_start = find_alignment(distorted, reference)
+            usable = min(captured_frames - out_start, ref_frames - ref_start)
+            print(f"[4/5] captured {captured_frames} frames; aligned at "
+                  f"output+{out_start}/reference+{ref_start}; scoring {usable} frames")
+        else:
+            out_start = ref_start = 0
+            usable = captured_frames
+            print(f"[4/5] captured {captured_frames}/{expected_frames} frames; "
+                  "scoring with libvmaf")
         subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
-             "-i", str(distorted), "-i", str(args.source),
+             "-i", str(distorted), "-i", str(reference),
              "-lavfi",
-             "[0:v]setpts=PTS-STARTPTS[d];"
-             f"[1:v]trim=end_frame={captured_frames},setpts=PTS-STARTPTS[r];"
+             f"[0:v]trim=start_frame={out_start}:end_frame={out_start + usable},"
+             "setpts=PTS-STARTPTS[d];"
+             f"[1:v]trim=start_frame={ref_start}:end_frame={ref_start + usable},"
+             "setpts=PTS-STARTPTS[r];"
              f"[d][r]libvmaf=log_path={vmaf_json}:log_fmt=json:"
              f"n_threads={os.cpu_count() or 4}",
              "-f", "null", "-"],
@@ -266,13 +399,18 @@ def main() -> int:
         raw, clean = pool(scores), pool(clean_scores)
         worst = sorted(enumerate(clean_scores), key=lambda kv: kv[1])[:5]
 
+        source_label = args.uri or f"`{args.source}`"
+        align_note = (
+            f"Captures aligned automatically: output frame {out_start} matches "
+            f"reference frame {ref_start}." if args.uri else "No alignment needed."
+        )
         report = f"""# braidpipe VMAF report
 
 | | |
 | --- | --- |
 | Date | {started_at:%Y-%m-%d %H:%M:%S} |
-| Source | `{args.source}` |
-| Resolution | {probe(args.source, 'stream=width,height').replace(',', 'x')} @ {probe_fps(args.source):g} fps |
+| Source | {source_label} |
+| Resolution | {probe(reference, 'stream=width,height').replace(',', 'x')} @ {probe_fps(reference):g} fps |
 | Streamed duration | {duration:.1f} s |
 | Verdict | **{verdict(clean['mean'])}** |
 
@@ -288,7 +426,7 @@ SRT latency: {args.latency} ms on both the receiving and sending side.
 
 ## Capture
 
-{captured_frames} of ~{expected_frames} frames captured.
+{captured_frames} of ~{expected_frames} frames captured. {align_note}
 {f'{tail} trailing frames were cut off by capture shutdown and are excluded from the clean pooling below.' if tail else 'No truncated tail detected.'}
 
 ## Scores
@@ -306,7 +444,7 @@ inspection, below 80 clearly visible.
 ## Files
 
 - `distorted.ts` - the captured braidpipe output
-- `vmaf.json` - per-frame libvmaf scores
+{'- `reference.ts` - the recorded input stream (the VMAF reference)' + chr(10) if args.uri else ''}- `vmaf.json` - per-frame libvmaf scores
 - `daemon.log` - braidpipe daemon output
 """
         report_md.write_text(report)
@@ -318,7 +456,7 @@ inspection, below 80 clearly visible.
         print(f"report: {report_md}")
         return 0
     finally:
-        for proc in (capture, daemon):
+        for proc in (capture, recorder, daemon):
             if proc and proc.poll() is None:
                 proc.kill()
 

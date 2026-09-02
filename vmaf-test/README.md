@@ -27,6 +27,15 @@ same file):
 python3 vmaf-test/run_vmaf_test.py source.mp4 --feed 127.0.0.1:8890
 ```
 
+Against a live non-SRT source (HTTP/UDP/RTP restream): no source file — the
+incoming stream itself is recorded as the reference and the two captures are
+aligned automatically by content. `--duration` is required, and the server
+must accept two simultaneous clients (the daemon and the recorder):
+
+```bash
+python3 vmaf-test/run_vmaf_test.py --uri 'http://host:8000/play/ch1' --duration 60
+```
+
 Options: `--preset` (default `lowlatency`), `--latency` (SRT latency in ms,
 both sides, default 200), `--duration N` (test only the first N seconds).
 `BRAIDPIPE_*` environment variables are passed through to the daemon, and
