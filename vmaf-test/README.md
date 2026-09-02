@@ -7,7 +7,10 @@ is captured, and the two are compared frame by frame.
 
 ## Requirements
 
-- `ffmpeg` / `ffprobe` built with libvmaf (Homebrew's ffmpeg includes it)
+- `ffmpeg` / `ffprobe` built with libvmaf. Homebrew's ffmpeg includes it;
+  most Linux distro packages do **not** ("No such filter: 'libvmaf'") — grab
+  a [static build](https://johnvansickle.com/ffmpeg/) and either put it on
+  PATH or set `FFMPEG=/path/to/ffmpeg FFPROBE=/path/to/ffprobe`
 - a built daemon: `cargo build --release`
 - an H.264/H.265 source file — it is both what gets streamed in and the
   reference the output is scored against
@@ -45,13 +48,18 @@ Options: `--preset` (default `lowlatency`), `--latency` (SRT latency in ms,
 both sides, default 200), `--duration N` (test only the first N seconds).
 `BRAIDPIPE_*` environment variables are passed through to the daemon, and
 anything after a standalone `--` becomes daemon CLI flags. A complete,
-typical invocation — encoder config via env vars and flags, an SRT input
+typical invocation — encoder config via env vars and flags, an SRT feed
 sending the file, the file as reference:
 
 ```bash
+# terminal 1: the feed (an SRT listener streaming the reference file)
+ffmpeg -re -i ~/Videos/match_1080p50.mp4 -c copy -f mpegts \
+  'srt://0.0.0.0:8890?mode=listener&latency=200'
+
+# terminal 2: the test
 BRAIDPIPE_BITRATE_KBPS=16000 BRAIDPIPE_GOP_SECONDS=1 BRAIDPIPE_SRT_LATENCY_MS=200 \
-python3 vmaf-test/run_vmaf_test.py source.mp4 \
-  --uri 'srt://192.168.201.22:8890?mode=caller&latency=200' --latency 200 \
+python3 vmaf-test/run_vmaf_test.py ~/Videos/match_1080p50.mp4 \
+  --feed 127.0.0.1:8890 --latency 200 \
   -- --preset=lowlatency --width=1920 --height=1080 --fps=50
 ```
 

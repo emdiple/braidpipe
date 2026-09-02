@@ -17,6 +17,7 @@ Requires: ffmpeg/ffprobe with libvmaf, and a built braidpipe binary.
 import argparse
 import json
 import os
+import re
 from collections import Counter
 import signal
 import statistics
@@ -28,6 +29,11 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DAEMON_BIN = REPO_ROOT / "target" / "release" / "braidpipe"
+
+# Point these at a different build when the system one lacks libvmaf
+# (most Linux distro ffmpeg builds do).
+FFMPEG = os.environ.get("FFMPEG", "ffmpeg")
+FFPROBE = os.environ.get("FFPROBE", "ffprobe")
 
 IN_PORT = 8890
 OUT_PORT = 8891
@@ -43,11 +49,29 @@ BROKEN_TAIL_THRESHOLD = 20.0
 ALIGN_PROBES = (10, 30, 50, 70, 90)
 
 
+def ensure_libvmaf() -> None:
+    try:
+        filters = subprocess.run(
+            [FFMPEG, "-hide_banner", "-filters"],
+            capture_output=True, text=True,
+        ).stdout
+    except FileNotFoundError:
+        sys.exit(f"'{FFMPEG}' not found - install ffmpeg, or point the FFMPEG "
+                 "env var at a binary")
+    if "libvmaf" not in filters:
+        sys.exit(
+            f"'{FFMPEG}' is built without libvmaf (distro packages usually are).\n"
+            "Install a build that has it - e.g. the static build from\n"
+            "https://johnvansickle.com/ffmpeg/ - and either put its ffmpeg/ffprobe\n"
+            "on PATH or point the FFMPEG and FFPROBE env vars at them."
+        )
+
+
 def probe(path: Path, entries: str) -> str:
     # An MPEG-TS capture can list the same stream under two program entries;
     # keep the first line only.
     return subprocess.check_output(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+        [FFPROBE, "-v", "error", "-select_streams", "v:0",
          "-show_entries", entries, "-of", "csv=p=0", str(path)],
         text=True,
     ).strip().splitlines()[0]
@@ -60,7 +84,7 @@ def probe_fps(path: Path) -> float:
 
 def count_frames(path: Path) -> int:
     return int(subprocess.check_output(
-        ["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+        [FFPROBE, "-v", "error", "-count_frames", "-select_streams", "v:0",
          "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(path)],
         text=True,
     ).strip().splitlines()[0])
@@ -135,7 +159,7 @@ def stop_process(proc: subprocess.Popen | None, sig: int = signal.SIGINT,
 def gray_frames(path: Path, count: int) -> list[bytes]:
     """Decodes the first `count` frames as 64x36 grayscale thumbnails."""
     raw = subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", str(path), "-frames:v", str(count),
+        [FFMPEG, "-v", "error", "-i", str(path), "-frames:v", str(count),
          "-vf", "scale=64:36", "-pix_fmt", "gray", "-f", "rawvideo", "-"],
         capture_output=True, check=True,
     ).stdout
@@ -172,6 +196,21 @@ def find_alignment(distorted: Path, reference: Path,
     # start the comparison right at frame 0.
     dist_start = max(10, -offset)
     return dist_start, dist_start + offset
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def codec_paths(log: Path) -> dict[str, str]:
+    """Reads which video encoder/decoder the daemon picked and whether each
+    runs on the GPU (hardware) or the CPU (software), from its log."""
+    text = ANSI_RE.sub("", log.read_text()) if log.exists() else ""
+    found = {}
+    for role, kind, element in re.findall(
+            r"Video (encoder|decoder) in use \((\w+)\).*?element=(\S+)", text):
+        side = "GPU (hardware)" if kind == "hardware" else "CPU (software)"
+        found[role] = f"{element} - {side}"
+    return found
 
 
 def pool(scores: list[float]) -> dict:
@@ -249,6 +288,7 @@ def main() -> int:
     record_reference = bool(args.uri and not args.source)
     if not DAEMON_BIN.is_file():
         sys.exit(f"daemon binary not found: {DAEMON_BIN} (run: cargo build --release)")
+    ensure_libvmaf()
     if args.feed:
         host, _, port = args.feed.rpartition(":")
         if not port.isdigit():
@@ -304,13 +344,13 @@ def main() -> int:
             print(f"[2/5] recording the input stream as reference "
                   f"({duration:.0f}s) and capturing the output")
             recorder = subprocess.Popen(
-                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
                  "-i", args.uri, "-c", "copy", "-t", str(duration),
                  "-f", "mpegts", str(reference)],
             )
         else:
             print(f"[2/5] capturing output to {distorted.relative_to(args.workdir)}")
-        capture_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        capture_cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
                        "-i", f"srt://127.0.0.1:{OUT_PORT}?mode=caller&latency={args.latency}",
                        "-c", "copy"]
         if args.uri:
@@ -330,7 +370,7 @@ def main() -> int:
             wait_capture_drained(distorted, daemon, daemon_log, timeout=duration + 60)
         else:
             print(f"[3/5] streaming {args.source.name} ({duration:.1f}s at real-time speed)")
-            feed_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-re"]
+            feed_cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-re"]
             if args.duration:
                 feed_cmd += ["-t", str(args.duration)]
             feed_cmd += ["-i", str(args.source), "-c", "copy", "-f", "mpegts",
@@ -364,7 +404,7 @@ def main() -> int:
             print(f"[4/5] captured {captured_frames}/{expected_frames} frames; "
                   "scoring with libvmaf")
         subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
+            [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostats",
              "-i", str(distorted), "-i", str(reference),
              "-lavfi",
              f"[0:v]trim=start_frame={out_start}:end_frame={out_start + usable},"
@@ -378,6 +418,7 @@ def main() -> int:
         )
 
         print("[5/5] writing report")
+        codecs = codec_paths(daemon_log)
         frames = json.loads(vmaf_json.read_text())["frames"]
         scores = [f["metrics"]["vmaf"] for f in frames]
 
@@ -404,6 +445,8 @@ def main() -> int:
 | Source | {source_label} |
 | Resolution | {probe(reference, 'stream=width,height').replace(',', 'x')} @ {probe_fps(reference):g} fps |
 | Streamed duration | {duration:.1f} s |
+| Encoder | {codecs.get('encoder', 'not reported in the daemon log')} |
+| Decoder | {codecs.get('decoder', 'not reported in the daemon log')} |
 | Verdict | **{verdict(clean['mean'])}** |
 
 ## Configuration
@@ -444,6 +487,8 @@ inspection, below 80 clearly visible.
         print()
         print(f"VMAF mean {clean['mean']:.2f} (harmonic {clean['harmonic_mean']:.2f}, "
               f"min {clean['min']:.2f}) over {clean['frames']} frames")
+        print(f"encoder: {codecs.get('encoder', 'unknown')}  |  "
+              f"decoder: {codecs.get('decoder', 'unknown')}")
         print(f"-> {verdict(clean['mean'])}")
         print(f"report: {report_md}")
         return 0
