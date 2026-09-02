@@ -6,9 +6,10 @@ output, scores it against the reference with libvmaf, and writes a per-run
 folder with the capture, raw scores, daemon log, and a markdown report.
 
 Usage:
-    python3 run_vmaf_test.py yoursource.mp4
-    python3 run_vmaf_test.py yoursource.mp4 --feed 127.0.0.1:8890
-    python3 run_vmaf_test.py --uri 'http://host:8000/play/ch1' --duration 60
+    python3 run_vmaf_test.py source.mp4                              # script streams the file itself
+    python3 run_vmaf_test.py source.mp4 --feed 127.0.0.1:8890        # external SRT listener feed
+    python3 run_vmaf_test.py source.mp4 --uri 'srt://host:8890?mode=caller'   # any input URI, file as reference
+    python3 run_vmaf_test.py --uri 'http://host:8000/play/ch1' --duration 60  # live stream, no file
 
 Requires: ffmpeg/ffprobe with libvmaf, and a built braidpipe binary.
 """
@@ -85,13 +86,18 @@ def wait_for_udp_port(port: int, daemon: subprocess.Popen, log: Path,
 
 def wait_capture_drained(path: Path, daemon: subprocess.Popen, log: Path,
                          quiet: float = 3.0, timeout: float = 60.0,
-                         no_data_timeout: float = 15.0) -> None:
+                         no_data_timeout: float = 15.0,
+                         proc: subprocess.Popen | None = None) -> None:
     """Waits until the capture file is non-empty and has stopped growing for
-    `quiet` seconds. Fails fast if no data ever arrives or the daemon dies."""
+    `quiet` seconds - or, if `proc` (the ffmpeg writing it) is given, until
+    that process exits on its own. Fails fast if no data ever arrives or the
+    daemon dies."""
     start = time.monotonic()
     deadline = start + timeout
     last_size, last_change = -1, time.monotonic()
     while time.monotonic() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return  # the writer finished; the file is final
         size = path.stat().st_size if path.exists() else 0
         if size == 0:
             if daemon.poll() is not None:
@@ -111,23 +117,6 @@ def wait_capture_drained(path: Path, daemon: subprocess.Popen, log: Path,
             return
         time.sleep(0.25)
     raise RuntimeError(f"capture never went quiet within {timeout:.0f}s")
-
-
-def wait_or_fail(proc: subprocess.Popen, timeout: float, what: str,
-                 log: Path) -> None:
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            f"{what} did not finish within {timeout:.0f}s; daemon log tail:\n"
-            + "\n".join(log.read_text().splitlines()[-10:])
-        ) from None
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"{what} failed (ffmpeg exit code {proc.returncode}); "
-            "daemon log tail:\n"
-            + "\n".join(log.read_text().splitlines()[-10:])
-        )
 
 
 def stop_process(proc: subprocess.Popen | None, sig: int = signal.SIGINT,
@@ -219,11 +208,13 @@ def main() -> int:
                          "argument is still the VMAF reference and must be the same "
                          "content the feed sends")
     ap.add_argument("--uri", default=None,
-                    help="arbitrary daemon input URI (http://, udp://, rtp://, ...). "
-                         "The incoming stream is recorded and used as the VMAF "
-                         "reference, so no source file is given; requires --duration. "
-                         "The server must accept two simultaneous clients (the daemon "
-                         "and the recorder) - for an SRT listener input use --feed")
+                    help="daemon input URI (srt://, http://, udp://, rtp://, ...). "
+                         "With a source file the file is the VMAF reference and must "
+                         "be the same content the stream sends (the captures are "
+                         "aligned by content automatically). Without a source file "
+                         "the incoming stream is recorded as the reference, which "
+                         "requires --duration and a server that accepts two "
+                         "simultaneous clients (the daemon and the recorder)")
     ap.add_argument("--duration", type=float, default=None,
                     help="seconds to stream/score (required with --uri; otherwise "
                          "defaults to the whole source file)")
@@ -246,18 +237,16 @@ def main() -> int:
 
     if args.uri and args.feed:
         sys.exit("--uri and --feed are mutually exclusive")
-    if args.uri:
-        if args.source:
-            sys.exit("--uri records its own reference from the stream; "
-                     "drop the source file argument")
-        if not args.duration:
-            sys.exit("--uri input is treated as live; say how long to record "
-                     "with --duration N")
-    else:
-        if not args.source:
-            sys.exit("a source file is required (or use --uri)")
-        if not args.source.is_file():
-            sys.exit(f"source not found: {args.source}")
+    if not args.uri and not args.source:
+        sys.exit("a source file is required (or use --uri)")
+    if args.uri and not args.source and not args.duration:
+        sys.exit("--uri without a source file is treated as live; say how long "
+                 "to record with --duration N")
+    if args.source and not args.source.is_file():
+        sys.exit(f"source not found: {args.source}")
+    # Without a source file the incoming stream itself must be recorded to
+    # serve as the reference.
+    record_reference = bool(args.uri and not args.source)
     if not DAEMON_BIN.is_file():
         sys.exit(f"daemon binary not found: {DAEMON_BIN} (run: cargo build --release)")
     if args.feed:
@@ -284,7 +273,7 @@ def main() -> int:
     vmaf_json = run_dir / "vmaf.json"
     daemon_log = run_dir / "daemon.log"
     report_md = run_dir / "report.md"
-    reference = run_dir / "reference.ts" if args.uri else args.source
+    reference = run_dir / "reference.ts" if record_reference else args.source
 
     duration = args.duration or float(probe(args.source, "format=duration"))
     env_vars = {k: v for k, v in sorted(os.environ.items()) if k.startswith("BRAIDPIPE_")}
@@ -311,7 +300,7 @@ def main() -> int:
             )
         wait_for_udp_port(OUT_PORT, daemon, daemon_log)
 
-        if args.uri:
+        if record_reference:
             print(f"[2/5] recording the input stream as reference "
                   f"({duration:.0f}s) and capturing the output")
             recorder = subprocess.Popen(
@@ -329,9 +318,12 @@ def main() -> int:
         capture = subprocess.Popen(capture_cmd + [str(distorted)])
 
         if args.uri:
-            print(f"[3/5] recording from {args.uri} for {duration:.0f}s")
-            wait_or_fail(capture, duration + 60, "the output capture", daemon_log)
-            wait_or_fail(recorder, duration + 60, "the reference recorder", daemon_log)
+            print(f"[3/5] streaming from {args.uri} for {duration:.0f}s")
+            wait_capture_drained(distorted, daemon, daemon_log,
+                                 timeout=duration + 60, proc=capture)
+            if recorder:
+                wait_capture_drained(reference, daemon, daemon_log,
+                                     timeout=duration + 60, proc=recorder)
         elif args.feed:
             print(f"[3/5] using external feed at {args.feed}; "
                   f"waiting for the stream to end (~{duration:.0f}s)")
@@ -444,7 +436,7 @@ inspection, below 80 clearly visible.
 ## Files
 
 - `distorted.ts` - the captured braidpipe output
-{'- `reference.ts` - the recorded input stream (the VMAF reference)' + chr(10) if args.uri else ''}- `vmaf.json` - per-frame libvmaf scores
+{'- `reference.ts` - the recorded input stream (the VMAF reference)' + chr(10) if record_reference else ''}- `vmaf.json` - per-frame libvmaf scores
 - `daemon.log` - braidpipe daemon output
 """
         report_md.write_text(report)

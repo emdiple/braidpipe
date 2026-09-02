@@ -20,30 +20,39 @@ Self-contained (the script streams the source itself):
 python3 vmaf-test/run_vmaf_test.py source.mp4
 ```
 
-Against an already-running external SRT feed (must be a listener sending the
-same file):
+Against a streaming input that sends that same file (SRT, HTTP, UDP, RTP —
+the file stays the VMAF reference, and the captures are aligned by content
+automatically):
 
 ```bash
-python3 vmaf-test/run_vmaf_test.py source.mp4 --feed 127.0.0.1:8890
+python3 vmaf-test/run_vmaf_test.py source.mp4 --uri 'srt://host:8890?mode=caller'
+python3 vmaf-test/run_vmaf_test.py source.mp4 --feed 127.0.0.1:8890   # shorthand for an SRT listener feed
 ```
 
-Against a live non-SRT source (HTTP/UDP/RTP restream): no source file — the
-incoming stream itself is recorded as the reference and the two captures are
-aligned automatically by content. `--duration` is required, and the server
-must accept two simultaneous clients (the daemon and the recorder):
+Against a live stream with no file behind it: the incoming stream itself is
+recorded as the reference. `--duration` is required, and the server must
+accept two simultaneous clients (the daemon and the recorder):
 
 ```bash
 python3 vmaf-test/run_vmaf_test.py --uri 'http://host:8000/play/ch1' --duration 60
 ```
 
+The daemon side is always `--passthrough-only` with the script's own SRT
+output — only the encoding configuration is yours to vary. Audio is never
+needed: VMAF scores video only.
+
 Options: `--preset` (default `lowlatency`), `--latency` (SRT latency in ms,
 both sides, default 200), `--duration N` (test only the first N seconds).
 `BRAIDPIPE_*` environment variables are passed through to the daemon, and
-anything after a standalone `--` becomes daemon CLI flags:
+anything after a standalone `--` becomes daemon CLI flags. A complete,
+typical invocation — encoder config via env vars and flags, an SRT input
+sending the file, the file as reference:
 
 ```bash
-BRAIDPIPE_BITRATE_KBPS=16000 BRAIDPIPE_GOP_SECONDS=1 \
-python3 vmaf-test/run_vmaf_test.py source.mp4 -- --fps 50 --width 1920 --height 1080
+BRAIDPIPE_BITRATE_KBPS=16000 BRAIDPIPE_GOP_SECONDS=1 BRAIDPIPE_SRT_LATENCY_MS=200 \
+python3 vmaf-test/run_vmaf_test.py source.mp4 \
+  --uri 'srt://192.168.201.22:8890?mode=caller&latency=200' --latency 200 \
+  -- --preset=lowlatency --width=1920 --height=1080 --fps=50
 ```
 
 Streaming happens at real-time speed, so a run takes the clip's duration plus
