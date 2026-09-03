@@ -17,6 +17,8 @@ import time
 
 import numpy as np
 
+from .contract import check_contract
+
 # Wire header matching Rust net.rs, 24 bytes little-endian:
 # frame_id u64, time_us u64, payload_len u32, slot u8, flags u8, 2 pad.
 # time_us carries the capture timestamp daemon -> worker and this worker's
@@ -49,6 +51,7 @@ def connect(daemon: str, retry_interval: float = 1.0) -> "RemoteWorkerLink":
                 continue
             config = json.loads(reply)
             if config.get("type") == "config" and config.get("transport") == "tcp-raw":
+                check_contract(config, "tcp-raw")
                 break
             raise RuntimeError(f"daemon refused tcp-raw: {config}")
     finally:

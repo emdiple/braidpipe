@@ -1,0 +1,44 @@
+# Publishes the worker SDK to PyPI on every v* tag, via trusted publishing —
+# no API token lives in the repo. One-time setup on pypi.org (Manage project →
+# Publishing, or "add a pending publisher" before the first release):
+#   project: braidpipe, owner: emdiple, repo: braidpipe,
+#   workflow: publish-pypi.yml, environment: pypi
+# and a GitHub environment named "pypi" under Settings → Environments.
+name: publish to pypi
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: refuse a tag that disagrees with the package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(python -c "import tomllib; print(tomllib.load(open('python/pyproject.toml','rb'))['project']['version'])")
+          [ "$tag" = "$ver" ] || { echo "tag v$tag != package version $ver"; exit 1; }
+      - run: pip install build
+      - run: python -m build python/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: python/dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # what trusted publishing authenticates with
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

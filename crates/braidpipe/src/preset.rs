@@ -307,10 +307,15 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
         // cbr-ld-hq is the low-delay high-quality flavor of CBR and
         // zerolatency=true removes the reordering delay outright; b-adapt and
         // bframes only restate their defaults, but this tuning depends on
-        // them, so they are pinned. The caps keep the encoder from quietly
-        // negotiating down from high profile, which every NVENC supports.
+        // them, so they are pinned. spatial-aq shifts bits into detailed
+        // regions and weighted-pred fixes fades; both cost only encoder
+        // throughput, never delay -- unlike rc-lookahead/temporal-aq, which
+        // buy quality with N frames of latency and so stay off. The caps keep
+        // the encoder from quietly negotiating down from high profile, which
+        // every NVENC supports.
         Encoder::Nvenc => format!(
             "nvh264enc bitrate={} gop-size={keyint} rc-mode={} preset={} \
+             spatial-aq=true aq-strength=8 weighted-pred=true \
              vbv-buffer-size={}{} ! video/x-h264,profile=high",
             p.bitrate_kbps,
             if p.zerolatency { "cbr-ld-hq" } else { "cbr" },
@@ -356,12 +361,18 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
     } else if output.starts_with("srt://") {
         // The leaky queue keeps a stalled or slow receiver from backpressuring
         // the encoder: packets drop at the sink instead of the stream falling
-        // behind real time.
+        // behind real time. It must be sized in time, not buffers: mpegtsmux
+        // flushes its 1316-byte chunks in clusters (especially when audio is
+        // interleaved), and a buffer-count cap small enough to be useful
+        // overflows on every cluster, leaking mid-PES chunks that corrupt the
+        // stream for every receiver.
         format!(
             "mpegtsmux name=mux alignment=7 ! \
-             queue max-size-buffers=3 leaky=downstream ! \
+             queue max-size-buffers=0 max-size-bytes=0 max-size-time={} leaky=downstream ! \
              srtsink {sync} wait-for-connection={} latency={} uri={output}",
-            p.srt_wait_for_connection, p.srt_latency_ms
+            u64::from(p.srt_latency_ms) * 1_000_000,
+            p.srt_wait_for_connection,
+            p.srt_latency_ms
         )
     } else if let Some(rest) = output.strip_prefix("udp://") {
         let (host, port) = rest
@@ -498,7 +509,10 @@ mod tests {
         let p = resolve("zerolatency", no_env).unwrap();
         let sink = render(&p, "srt://127.0.0.1:8888", 30).unwrap();
         assert!(sink.contains("mpegtsmux name=mux alignment=7"));
-        assert!(sink.contains("queue max-size-buffers=3 leaky=downstream"));
+        // zerolatency's 50 ms budget -> a 50 ms time-sized leaky queue.
+        assert!(sink.contains(
+            "queue max-size-buffers=0 max-size-bytes=0 max-size-time=50000000 leaky=downstream"
+        ));
         assert!(sink.contains(
             "srtsink sync=false wait-for-connection=false latency=50 uri=srt://127.0.0.1:8888"
         ));
@@ -576,6 +590,7 @@ mod tests {
         let nvenc = with_encoder("nvenc");
         assert!(nvenc.contains(
             "nvh264enc bitrate=4500 gop-size=60 rc-mode=cbr-ld-hq preset=low-latency-hq \
+             spatial-aq=true aq-strength=8 weighted-pred=true \
              vbv-buffer-size=900 b-adapt=false bframes=0 zerolatency=true ! \
              video/x-h264,profile=high"
         ));

@@ -13,47 +13,35 @@ The other side of the shared memory: the contract a worker implements, the bundl
 
 ## Writing a Python worker
 
-A worker is a loop over one Unix datagram socket. `attach()` runs the handshake — it says hello to the daemon, which answers with the shared-memory segment's file descriptor — and returns a `SharedMemoryManager` giving you a zero-copy NumPy view of each slot, so mutating the array in place *is* writing to the output frame — there's no separate send step for pixels.
+The `braidpipe` package in [python/](../python/) is the worker SDK: you write a function that mutates a frame, `braidpipe.run()` owns the loop — the handshake, the per-frame notification, the zero-copy NumPy view of the slot, freeing it, and the ack. Install it into whatever environment your worker runs in:
 
-```python
-import json, os, socket
-from shm import attach
-
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-if os.path.exists("/tmp/braidpipe_python.sock"):
-    os.remove("/tmp/braidpipe_python.sock")
-sock.bind("/tmp/braidpipe_python.sock")
-
-shm = attach(sock, "/tmp/braidpipe_rust.sock")   # handshake; reads geometry from the header
-
-while True:
-    packet = json.loads(sock.recvfrom(512)[0])
-    if "frame_id" not in packet:
-        continue   # a control packet, not a frame
-    frame = shm.get_slot_numpy_array(packet["slot_index"])   # (H, W, 3) uint8, RGB
-
-    # ... your inference here; mutate `frame` in place ...
-
-    shm.mark_slot_free(packet["slot_index"])
-    try:
-        sock.sendto(json.dumps({
-            "frame_id": packet["frame_id"],
-            "slot_index": packet["slot_index"],
-            "processing_time_us": 0,
-            "success": True,
-        }).encode(), "/tmp/braidpipe_rust.sock")
-    except OSError:
-        pass   # a full socket buffer is not worth dying over
+```bash
+pip install braidpipe     # from PyPI; numpy is its only dependency
+pip install -e python/    # or editable, from the repository root
 ```
 
-Four rules keep the stream healthy:
+A complete worker:
 
-1. **Finish inside the budget.** You have 1.5 frame periods. Slower than that and your output is simply not used for that frame — correctness is preserved, but the overlay flickers. For heavy models, drop the input `--fps`, or run inference on every Nth frame and cache the result.
+```python
+import braidpipe
+
+def process(frame):          # (H, W, 3) uint8, RGB — mutate it in place
+    frame[:, :, 0] //= 2     # your inference here
+
+if __name__ == "__main__":
+    braidpipe.run(process)
+```
+
+Mutating the array in place *is* writing to the output frame — there is no separate send step for pixels. Give `process` a second parameter and `run()` passes a `FrameContext` with `frame_id`, `timestamp_us` (the daemon's hand-over clock, so `time.time_ns() // 1000 - ctx.timestamp_us` is the IPC delay), the frame geometry, and which transport is in use. Raising is safe: the exception is reported as `"success": false` and costs one passthrough frame, never the stream. The same script attaches over shared memory next to a local daemon, or over [tcp-raw](#workers-on-another-machine-tcp-raw) when `BRAIDPIPE_DAEMON=host:port` is set.
+
+Four rules keep the stream healthy. `run()` discharges the middle two for you — they are listed because every other attach path (a raw loop, another language) must honor them too:
+
+1. **Finish inside the budget.** You have 1.5 frame periods. Slower than that and your output is simply not used for that frame — correctness is preserved, but the overlay flickers. For heavy models, drop the input `--fps`, run inference on every Nth frame, or hand the model to `braidpipe.BackgroundModel`, which runs it on a thread over the newest frame while every frame is annotated with the latest cached result — [worker_detect.py](../examples/worker_detect.py) shows that end to end.
 2. **Always free the slot.** The ring has four slots; leaking them starves the relay. Free the slot even on your own error paths.
 3. **Always send an ack, and never die sending it.** Report `"success": false` for a failed frame — the relay treats that as a failure and passes the original through, which is exactly right. Wrap the send in `try/except OSError`; a full datagram buffer (`ENOBUFS`) is normal backpressure, not a fatal condition.
 4. **Frames are RGB, not BGR.** OpenCV's conventions assume BGR, so the familiar `(0, 0, 255)` "red" renders as blue here. Use `(255, 0, 0)` for red, or convert with `cv2.cvtColor` if you're feeding a model trained on BGR.
 
-Point `--python-script` at your own file. The simplest start is a copy of [worker.py](../python/braidpipe/worker.py): the whole contract with an empty `process()` hook to fill in. Because Python puts the script's own directory on `sys.path`, a worker living beside `shm.py` can `from shm import attach` directly; from elsewhere, add `python/braidpipe` to `sys.path` (the bundled examples do exactly this) or install it as a package.
+Point `--python-script` at your own file. The simplest start is a copy of [worker.py](../python/braidpipe/worker.py): the template with an empty `process()` hook to fill in. The bundled scripts fall back to putting `python/` on `sys.path` themselves, so they run from a fresh checkout with nothing installed. Workers that want the loop rather than the callback can still build on the transport primitives — `attach()`/`SharedMemoryManager` for shared memory, `connect()`/`RemoteWorkerLink` for tcp-raw — which `braidpipe` exports unchanged; the raw protocol they speak is [the IPC contract](#the-ipc-contract) below.
 
 ## Bundled examples
 
@@ -61,9 +49,9 @@ The generic template lives with the transport layer; the demonstration workers l
 
 | Worker | Needs | Shows |
 | --- | --- | --- |
-| [worker.py](../python/braidpipe/worker.py) | numpy | The raw contract, nothing else: attach, receive, free, ack — your code goes in its `process()` hook |
-| [worker_edges.py](../examples/worker_edges.py) | opencv | A whole-frame pixel transform, reporting `success: false` instead of dying, and both transports — set `BRAIDPIPE_DAEMON` for [tcp-raw](#workers-on-another-machine-tcp-raw) |
-| [worker_detect.py](../examples/worker_detect.py) | ultralytics, torch | A model too slow to run inline, moved to a thread with cached results |
+| [worker.py](../python/braidpipe/worker.py) | numpy | The template to copy: an empty `process()` hook handed to `braidpipe.run()`, nothing else |
+| [worker_edges.py](../examples/worker_edges.py) | opencv | A whole-frame pixel transform in a single function — the shape most workers take |
+| [worker_detect.py](../examples/worker_detect.py) | ultralytics, torch | A model too slow to run inline, moved off the hot path with `braidpipe.BackgroundModel` |
 | [worker_stamp.py](../examples/worker_stamp.py) | numpy | Instrumentation rather than transform — see [Measuring latency](operations.md#measuring-latency) |
 
 ```bash
@@ -73,7 +61,7 @@ cargo run -p braidpipe --release -- --python-script examples/worker_detect.py
 
 `worker_edges.py` is the one to reach for when testing the plumbing: no model, no network, and it rewrites only the left half of the frame so the boundary between processed and untouched pixels is visible on screen.
 
-`worker_detect.py` runs YOLO and is the more instructive one. A CPU inference pass does not fit in 50 ms, so the socket loop never waits for it — a detector thread takes a copy of every third frame, and every frame is annotated with the most recent boxes available. Boxes lag the picture slightly; no frame misses its deadline. It also caps `torch.set_num_threads` and the inference resolution, because torch left unbounded takes every core and starves the loop that only needs a millisecond of it. Without those caps the worker flaps between branches every few seconds; with them the AI branch stays selected. The first run downloads weights (~6 MB) into the working directory.
+`worker_detect.py` runs YOLO and is the more instructive one. A CPU inference pass does not fit in 50 ms, so the frame loop never waits for it — `braidpipe.BackgroundModel` takes a copy of every third frame onto its own thread, and every frame is annotated with the most recent boxes available. Boxes lag the picture slightly; no frame misses its deadline. It also caps `torch.set_num_threads` and the inference resolution, because torch left unbounded takes every core and starves the loop that only needs a millisecond of it. Without those caps the worker flaps between branches every few seconds; with them the AI branch stays selected. The first run downloads weights (~6 MB) into the working directory.
 
 ## Writing a worker in another language
 
@@ -139,12 +127,12 @@ For a containerized worker only the socket directory must cross the container bo
 # machine A — the daemon
 cargo run -p braidpipe --release -- --external-worker --worker-listen 0.0.0.0:7300
 
-# machine B — the edge worker, pointed at the daemon (of the bundled
-# workers, worker_edges.py is the one with the remote-transport switch)
+# machine B — the edge worker, pointed at the daemon (BRAIDPIPE_DAEMON switches
+# any worker built on braidpipe.run() to the tcp-raw transport)
 BRAIDPIPE_DAEMON=192.168.1.10:7300 python3 examples/worker_edges.py
 ```
 
-The worker's hello (`{"type": "hello", "transports": ["tcp-raw"]}`) is answered with `{"type": "config", "transport": "tcp-raw", "data_port": …, "width": …, "height": …, "channels": …, "format": "rgb"}`. The worker then opens one TCP connection to `data_port`, and every frame in either direction is a fixed 24-byte header plus the raw pixels — [python/braidpipe/remote.py](../python/braidpipe/remote.py) wraps this in the same attach-and-loop shape the shm side has:
+The worker's hello (`{"type": "hello", "transports": ["tcp-raw"]}`) is answered with `{"type": "config", "transport": "tcp-raw", "contract": 1, "data_port": …, "width": …, "height": …, "channels": …, "format": "rgb"}`. The worker then opens one TCP connection to `data_port`, and every frame in either direction is a fixed 24-byte header plus the raw pixels — [python/braidpipe/remote.py](../python/braidpipe/remote.py) wraps this in the same attach-and-loop shape the shm side has:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -167,9 +155,9 @@ Wire time also eats into the 1.5-frame deadline (a 720p frame takes ~24 ms each 
 
 ## The IPC contract
 
-**Shared memory** — one *anonymous* segment (a `memfd` on Linux, an unlinked POSIX object elsewhere) holding a 32-byte header followed by `slot_count` slots. Each slot is a 24-byte header plus `width × height × channels` bytes of pixels. The segment has no name anywhere: a worker gets in by sending `{"type": "hello"}` to the daemon's socket (optionally with a `"transports"` list; over UDS the answer is always shm), and the daemon replies with a config datagram (body `{"type": "config", "transport": "shm", …}` describing the ring geometry) carrying the segment's file descriptor as `SCM_RIGHTS` ancillary data. The kernel duplicates the descriptor into the worker, which `fstat`s it for the size and `mmap`s it. Because nothing is ever named, nothing can collide between instances, go stale after a crash, or need permission juggling — the kernel frees the segment when the last descriptor and mapping are gone. A worker may say hello before the daemon is up (retry until answered) or at any point after; replies are sent whenever frames are flowing.
+**Shared memory** — one *anonymous* segment (a `memfd` on Linux, an unlinked POSIX object elsewhere) holding a 32-byte header followed by `slot_count` slots. Each slot is a 24-byte header plus `width × height × channels` bytes of pixels. The segment has no name anywhere: a worker gets in by sending `{"type": "hello"}` to the daemon's socket (optionally with a `"transports"` list; over UDS the answer is always shm), and the daemon replies with a config datagram (body `{"type": "config", "transport": "shm", "contract": 1, …}` describing the ring geometry) carrying the segment's file descriptor as `SCM_RIGHTS` ancillary data. The kernel duplicates the descriptor into the worker, which `fstat`s it for the size and `mmap`s it. Because nothing is ever named, nothing can collide between instances, go stale after a crash, or need permission juggling — the kernel frees the segment when the last descriptor and mapping are gone. A worker may say hello before the daemon is up (retry until answered) or at any point after; replies are sent whenever frames are flowing.
 
-All layouts are explicitly padded on the Rust side and mirrored by `struct` format strings in [python/braidpipe/shm.py](../python/braidpipe/shm.py), which assert their own sizes at import — a mismatch fails loudly instead of silently reading garbage.
+All layouts are explicitly padded on the Rust side and mirrored by `struct` format strings in [python/braidpipe/shm.py](../python/braidpipe/shm.py), which assert their own sizes at import — a mismatch fails loudly instead of silently reading garbage. The `contract` field in every config packet guards the same boundary across versions: it names the IPC contract the daemon speaks (`IPC_CONTRACT_VERSION` in Rust, `braidpipe.CONTRACT_VERSION` in Python — bumped together on any incompatible change), and a worker that sees a number it does not speak refuses to attach at handshake time instead of misreading frames. A config with no field at all is a pre-versioning daemon (≤ 0.2.0, contract 1): the SDK warns and proceeds.
 
 | Structure | Rust | Python format | Size |
 | --- | --- | --- | --- |
