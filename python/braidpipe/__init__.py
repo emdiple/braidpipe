@@ -28,7 +28,7 @@ from .remote import RemoteWorkerLink, connect
 from .runner import FrameContext, run, worker
 from .shm import SharedMemoryManager, attach
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "BackgroundModel",

@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "braidpipe"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "braidpipe-core",
  "braidpipe-engine",
@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "braidpipe-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "thiserror",
  "tokio",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "braidpipe-engine"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "braidpipe-core",
  "dispatch",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "braidpipe-ipc"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "braidpipe-core",
  "libc",
