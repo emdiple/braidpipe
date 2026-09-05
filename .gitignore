@@ -41,3 +41,6 @@ venv/
 
 # VMAF quality-test artifacts (captures, scores, logs)
 /vmaf-test/runs/
+
+# Launch/marketing drafts (kept local)
+docs/launch/
