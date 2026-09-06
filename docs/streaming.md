@@ -42,6 +42,8 @@ dns-sd -B _ndi._tcp local        # macOS; avahi-browse -r _ndi._tcp on Linux
 
 An optional `?url=host:port` skips discovery and connects straight to the sender (`ndisrc url-address`), which helps when mDNS does not cross the network. `--audio` taps the demuxer like any other source and needs no extra setup. Needs the `ndi` plugin from gst-plugins-rs and the NDI runtime.
 
+**The daemon waits for the source rather than timing out.** `ndisrc` on its own gives up after 10 s if the source is not there yet (`connect-timeout`) and after 5 s without a frame once it is (`timeout`), and either one ends the pipeline with the `EOS without available srcpad(s)` error above. The daemon sets both to `0`, which the element treats as "never": start braidpipe before the camera is on and it sits waiting, and if the source drops out for a while the video simply resumes when it comes back, with the output staying up throughout. To get the fail-fast behaviour back, pass the timeouts in milliseconds on the URI, e.g. `ndi://STUDIO-PC%20(Camera%201)?connect-timeout=10000&timeout=5000`.
+
 **A Blackmagic DeckLink capture card** (SDI/HDMI), via the `decklink://` pseudo-scheme:
 
 ```bash
@@ -280,7 +282,7 @@ If the source has no audio stream, don't pass `--audio` — the audio branch wou
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `-i, --source <PIPELINE>` | test pattern | Explicit GStreamer source fragment |
-| `--uri <URI>` | — | Input URI decoded by GStreamer (`srt://`, `udp://`, `rtp://`, `file://`), an NDI source (`ndi://<MACHINE%20(name)>[?url=host:port]`), or a DeckLink capture card (`decklink://<device>?mode=…&connection=…`) |
+| `--uri <URI>` | — | Input URI decoded by GStreamer (`srt://`, `udp://`, `rtp://`, `file://`), an NDI source (`ndi://<MACHINE%20(name)>[?url=host:port&connect-timeout=ms&timeout=ms]`, timeouts default to never), or a DeckLink capture card (`decklink://<device>?mode=…&connection=…`) |
 | `-o, --sink <PIPELINE>` | `videoconvert ! autovideosink` | Output fragment appended after the selector |
 | `--output <URL>` | — | Publish target (`rtmp://`, `srt://`, `udp://host:port`, `ndi://<name>`); builds the sink from `--preset` |
 | `--preset <NAME>` | `lowlatency` | Latency/bandwidth profile for `--output`, see [Output presets](#output-presets) |

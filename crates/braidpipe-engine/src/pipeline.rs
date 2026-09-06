@@ -458,16 +458,26 @@ impl GStreamerEngine {
     }
 }
 
-/// The `ndi://` pseudo-scheme for NDI sources: `ndi://<name>[?url=<host:port>]`,
-/// with the name percent-encoded, e.g. `ndi://STUDIO-PC%20(Camera%201)`.
+/// The `ndi://` pseudo-scheme for NDI sources:
+/// `ndi://<name>[?url=<host:port>&connect-timeout=<ms>&timeout=<ms>]`, with
+/// the name percent-encoded, e.g. `ndi://STUDIO-PC%20(Camera%201)`.
 /// `ndisrc` registers no GStreamer URI handler, so the daemon maps the scheme
 /// itself onto `ndisrc ! ndisrcdemux`, with the demuxer named `decoder` so the
 /// generated audio branch can tap it like any other demuxer. The name is the
 /// full one receivers list, `MACHINE (source)`; `url` skips discovery and
 /// connects straight to the sender's address (`ndisrc url-address`).
+///
+/// Both timeouts default to 0, which `ndisrc` treats as "never": the element's
+/// own defaults (10 s to connect, 5 s between frames) turn a source that is
+/// not up yet, or drops out for a moment, into EOS and a dead pipeline. The
+/// daemon exists to stay up through exactly that, so it waits for the source
+/// to appear and rides out gaps instead. Pass an explicit millisecond value
+/// to get the fail-fast behaviour back.
 pub struct NdiInput {
     name: String,
     url_address: Option<String>,
+    connect_timeout_ms: u32,
+    timeout_ms: u32,
 }
 
 impl NdiInput {
@@ -490,23 +500,48 @@ impl NdiInput {
             ));
         }
 
-        let mut url_address = None;
+        let mut input = Self {
+            name,
+            url_address: None,
+            connect_timeout_ms: 0,
+            timeout_ms: 0,
+        };
         for pair in query.split('&').filter(|pair| !pair.is_empty()) {
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            if key != "url" {
-                return Err(EngineError::BuildFailed(format!(
-                    "unknown ndi parameter '{key}' (supported: url)"
-                )));
+            match key {
+                "url" => {
+                    if value.is_empty()
+                        || !value
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-' | '[' | ']'))
+                    {
+                        return Err(EngineError::BuildFailed(format!(
+                            "invalid ndi url '{value}' (expected host:port)"
+                        )));
+                    }
+                    input.url_address = Some(value.to_string());
+                }
+                "connect-timeout" | "timeout" => {
+                    let ms: u32 = value.parse().map_err(|_| {
+                        EngineError::BuildFailed(format!(
+                            "invalid ndi {key} '{value}' (milliseconds, 0 waits forever)"
+                        ))
+                    })?;
+                    if key == "timeout" {
+                        input.timeout_ms = ms;
+                    } else {
+                        input.connect_timeout_ms = ms;
+                    }
+                }
+                _ => {
+                    return Err(EngineError::BuildFailed(format!(
+                        "unknown ndi parameter '{key}' (supported: url, connect-timeout, timeout)"
+                    )));
+                }
             }
-            if value.is_empty() || !value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-' | '[' | ']')) {
-                return Err(EngineError::BuildFailed(format!(
-                    "invalid ndi url '{value}' (expected host:port)"
-                )));
-            }
-            url_address = Some(value.to_string());
         }
 
-        Ok(Self { name, url_address })
+        Ok(input)
     }
 
     fn video_source(&self) -> String {
@@ -516,8 +551,10 @@ impl NdiInput {
             .map(|u| format!(" url-address={u}"))
             .unwrap_or_default();
         format!(
-            "ndisrc ndi-name={}{url} ! ndisrcdemux name=decoder decoder. ! queue ! video/x-raw ! videoconvert ! videoscale",
-            quote_launch(&self.name)
+            "ndisrc ndi-name={}{url} connect-timeout={} timeout={} ! ndisrcdemux name=decoder decoder. ! queue ! video/x-raw ! videoconvert ! videoscale",
+            quote_launch(&self.name),
+            self.connect_timeout_ms,
+            self.timeout_ms
         )
     }
 }
@@ -762,11 +799,20 @@ mod tests {
             .expect("valid ndi URI should build a source pipeline");
         assert_eq!(
             pipeline,
-            "ndisrc ndi-name=\"STUDIO-PC (Camera 1)\" ! ndisrcdemux name=decoder decoder. ! queue ! video/x-raw ! videoconvert ! videoscale"
+            "ndisrc ndi-name=\"STUDIO-PC (Camera 1)\" connect-timeout=0 timeout=0 ! ndisrcdemux name=decoder decoder. ! queue ! video/x-raw ! videoconvert ! videoscale"
         );
 
         let direct = GStreamerEngine::uri_source_pipeline("ndi://Cam?url=192.168.1.20:5961").unwrap();
-        assert!(direct.contains("ndisrc ndi-name=\"Cam\" url-address=192.168.1.20:5961 !"));
+        assert!(direct.contains("ndisrc ndi-name=\"Cam\" url-address=192.168.1.20:5961 connect-timeout=0 timeout=0 !"));
+    }
+
+    #[test]
+    fn ndi_waits_forever_unless_told_otherwise() {
+        let fail_fast =
+            GStreamerEngine::uri_source_pipeline("ndi://Cam?connect-timeout=10000&timeout=5000").unwrap();
+        assert!(fail_fast.contains(" connect-timeout=10000 timeout=5000 !"));
+        assert!(GStreamerEngine::uri_source_pipeline("ndi://Cam?timeout=soon").is_err());
+        assert!(GStreamerEngine::uri_source_pipeline("ndi://Cam?timeout=-1").is_err());
     }
 
     #[test]
