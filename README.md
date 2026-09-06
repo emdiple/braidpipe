@@ -57,7 +57,7 @@ The Rust daemon owns the media path. Python only ever sees pixels in a shared-me
 | GStreamer | 1.20+ | Needed for `appsrc leaky-type`; developed against 1.28 |
 | OS | Linux or macOS | Anonymous shared memory (fd-passing) + Unix datagram sockets |
 
-GStreamer plugins depend on what you actually stream: `srt` for SRT, `x264`/`libav` for H.264, `rtmp` for RTMP output, `avfvideosrc` (macOS, in plugins-bad) or `v4l2src` (Linux, in plugins-good) for cameras, and a third-party plugin for NDI.
+GStreamer plugins depend on what you actually stream: `srt` for SRT, `x264`/`libav` for H.264, `rtmp` for RTMP output, `avfvideosrc` (macOS, in plugins-bad) or `v4l2src` (Linux, in plugins-good) for cameras, and the `ndi` plugin from gst-plugins-rs plus the NDI runtime for NDI in or out (Homebrew's gstreamer includes the plugin; the Docker images do not).
 
 ## Install
 

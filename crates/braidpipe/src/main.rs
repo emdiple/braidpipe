@@ -34,7 +34,7 @@ struct Args {
     #[arg(short = 'o', long, default_value = "videoconvert ! autovideosink")]
     sink: String,
 
-    /// Output URL to publish to (rtmp://, srt:// or udp://host:port); builds the
+    /// Output URL to publish to (rtmp://, srt://, udp://host:port or ndi://name); builds the
     /// encoder and sink from --preset instead of requiring a full --sink string
     #[arg(long, value_name = "URL", conflicts_with = "sink")]
     output: Option<String>,
@@ -157,7 +157,7 @@ async fn run() -> Result<(), AppError> {
             .and_then(braidpipe_engine::pipeline::DecklinkInput::parse)
             .and_then(Result::ok)
             .map(|input| input.audio_tap());
-        let branch = preset::audio_branch(decklink_tap.as_deref())?;
+        let branch = preset::audio_branch(decklink_tap.as_deref(), args.output.as_deref())?;
         // The generated branch links two elements by name; make sure both
         // exist before GStreamer fails with a much less helpful message. A
         // BRAIDPIPE_AUDIO_BRANCH override may tap anything it likes.

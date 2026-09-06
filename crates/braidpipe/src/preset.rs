@@ -24,6 +24,10 @@
 //!   BRAIDPIPE_AUDIO_BITRATE_KBPS audio target bitrate (default 128)
 //!   BRAIDPIPE_AUDIO_BRANCH       replace the generated audio branch outright
 //!
+//! An `ndi://<name>` output is the exception to all of the encoder knobs: NDI
+//! carries raw video (the SDK does its own SpeedHQ compression), so only the
+//! sink sync setting applies and audio stays PCM.
+//!
 //! `--sink` still accepts a raw pipeline string and bypasses all of this.
 
 use std::fmt;
@@ -184,7 +188,7 @@ fn defaults(preset: &str) -> Option<Params> {
 }
 
 /// Builds the sink description for a preset and an output URL
-/// (rtmp://, srt:// or udp://host:port), env overrides applied.
+/// (rtmp://, srt://, udp://host:port or ndi://name), env overrides applied.
 ///
 /// `encoder` is the `--encoder` CLI flag. Precedence: a non-auto flag pins
 /// the codec outright; an explicit `--encoder auto` forces detection even
@@ -278,6 +282,21 @@ fn resolve(
 }
 
 fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
+    // NDI is not an encoded transport: the SDK takes raw frames and applies
+    // its own SpeedHQ compression on the way out, so none of the H.264 knobs
+    // apply. UYVY is NDI's native format -- anything else gets converted by
+    // the SDK per frame. The combiner is what gives the sink a video pad and
+    // an on-request audio pad under one name, so an audio branch can join at
+    // `mux.` exactly as it would with a muxer.
+    if let Some(name) = ndi_source_name(output)? {
+        return Ok(format!(
+            "videoconvert ! video/x-raw,format=UYVY ! ndisinkcombiner name=mux ! \
+             ndisink sync={} ndi-name={}",
+            p.sync,
+            quote_launch(&name)
+        ));
+    }
+
     let keyint = ((p.gop_seconds * f64::from(fps.max(1))).round() as u32).max(1);
 
     let encoder = match p.encoder {
@@ -382,7 +401,7 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
         format!("mpegtsmux name=mux alignment=7 ! udpsink {sync} host={host} port={port}")
     } else {
         return Err(format!(
-            "unsupported output '{output}' (expected rtmp://, srt:// or udp://host:port)"
+            "unsupported output '{output}' (expected rtmp://, srt://, udp://host:port or ndi://name)"
         ));
     };
 
@@ -398,6 +417,45 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
     ))
 }
 
+/// The NDI source name an `ndi://` output URL names, percent-decoded, or
+/// `None` for any other scheme. `ndi://Studio%20Out` mirrors the input side,
+/// where the same encoding addresses a source by its NDI name.
+fn ndi_source_name(output: &str) -> Result<Option<String>, String> {
+    let Some(encoded) = output.strip_prefix("ndi://") else {
+        return Ok(None);
+    };
+    let name = percent_decode(encoded)
+        .ok_or_else(|| format!("ndi output has a malformed percent-escape: '{output}'"))?;
+    if name.trim().is_empty() {
+        return Err(format!("ndi output must name the source: ndi://<name>, got '{output}'"));
+    }
+    Ok(Some(name))
+}
+
+fn percent_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Quotes a property value for gst-launch syntax, so names with spaces or
+/// quotes survive the parser.
+fn quote_launch(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
 /// The audio path from the source's decoder to the output muxer.
 ///
 /// Audio never enters the AI branch: it flows straight from `decoder.` (the
@@ -408,16 +466,34 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
 /// plain queues here just have to be deep enough to hold audio while the video
 /// leg spends its AI budget and encoder delay, and the defaults (1 s) dwarf
 /// both.
-pub fn audio_branch(tap: Option<&str>) -> Result<String, String> {
-    build_audio_branch(tap, |key| std::env::var(key).ok())
+///
+/// `output` is the `--output` URL: an `ndi://` target takes PCM rather than
+/// AAC, because NDI carries audio uncompressed.
+pub fn audio_branch(tap: Option<&str>, output: Option<&str>) -> Result<String, String> {
+    build_audio_branch(tap, output, |key| std::env::var(key).ok())
 }
 
 fn build_audio_branch(
     tap: Option<&str>,
+    output: Option<&str>,
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<String, String> {
     if let Some(branch) = env("BRAIDPIPE_AUDIO_BRANCH") {
         return Ok(branch);
+    }
+
+    // The tap is where audio comes from: the named decodebin of a --uri
+    // source by default, or a capture-card audio element (decklinkaudiosrc)
+    // when the source has no demuxer to tap.
+    let tap = tap.unwrap_or("decoder. ! queue ! audio/x-raw");
+
+    // NDI takes interleaved float PCM -- the only layout ndisinkcombiner's
+    // audio pad accepts -- so there is no encoder to configure.
+    if output.is_some_and(|o| o.starts_with("ndi://")) {
+        return Ok(format!(
+            "{tap} ! audioconvert ! audioresample ! \
+             audio/x-raw,format=F32LE,layout=interleaved ! queue ! mux."
+        ));
     }
 
     let encoder = env("BRAIDPIPE_AUDIO_ENCODER").unwrap_or_else(|| "avenc_aac".into());
@@ -425,11 +501,6 @@ fn build_audio_branch(
         Some(v) => parse_num("BRAIDPIPE_AUDIO_BITRATE_KBPS", &v)?,
         None => 128,
     };
-
-    // The tap is where audio comes from: the named decodebin of a --uri
-    // source by default, or a capture-card audio element (decklinkaudiosrc)
-    // when the source has no demuxer to tap.
-    let tap = tap.unwrap_or("decoder. ! queue ! audio/x-raw");
 
     // The common AAC encoders (avenc_aac, fdkaacenc, faac) all take bps.
     Ok(format!(
@@ -538,8 +609,34 @@ mod tests {
     }
 
     #[test]
+    fn ndi_output_sends_raw_uyvy_through_the_combiner() {
+        let p = resolve("lowlatency", no_env).unwrap();
+        let sink = render(&p, "ndi://Studio%20Out", 50).unwrap();
+        assert_eq!(
+            sink,
+            "videoconvert ! video/x-raw,format=UYVY ! ndisinkcombiner name=mux ! \
+             ndisink sync=false ndi-name=\"Studio Out\""
+        );
+        // No encoder anywhere: NDI compresses for itself.
+        assert!(!sink.contains("enc"));
+
+        let p = resolve("bandwidth", no_env).unwrap();
+        assert!(render(&p, "ndi://plain", 30).unwrap().contains("sync=true ndi-name=\"plain\""));
+
+        assert!(render(&p, "ndi://", 30).is_err());
+        assert!(render(&p, "ndi://%2", 30).is_err());
+        assert!(render(&p, "ndi://%zz", 30).is_err());
+    }
+
+    #[test]
+    fn ndi_name_quoting_survives_the_launch_parser() {
+        assert_eq!(quote_launch("a \"b\" \\c"), "\"a \\\"b\\\" \\\\c\"");
+        assert_eq!(percent_decode("Caf%C3%A9%20%22x%22").as_deref(), Some("Café \"x\""));
+    }
+
+    #[test]
     fn audio_branch_links_decoder_to_mux() {
-        let branch = build_audio_branch(None, no_env).unwrap();
+        let branch = build_audio_branch(None, None, no_env).unwrap();
         assert!(branch.starts_with("decoder. ! "));
         assert!(branch.ends_with(" ! mux."));
         assert!(branch.contains("avenc_aac bitrate=128000"));
@@ -547,15 +644,35 @@ mod tests {
 
     #[test]
     fn audio_branch_tap_override_replaces_the_decoder() {
-        let branch =
-            build_audio_branch(Some("decklinkaudiosrc device-number=0 ! queue"), no_env).unwrap();
+        let branch = build_audio_branch(
+            Some("decklinkaudiosrc device-number=0 ! queue"),
+            Some("srt://127.0.0.1:8888"),
+            no_env,
+        )
+        .unwrap();
         assert!(branch.starts_with("decklinkaudiosrc device-number=0 ! queue ! audioconvert"));
         assert!(branch.ends_with(" ! mux."));
     }
 
     #[test]
+    fn audio_branch_stays_pcm_for_ndi() {
+        let branch = build_audio_branch(None, Some("ndi://Studio%20Out"), no_env).unwrap();
+        assert_eq!(
+            branch,
+            "decoder. ! queue ! audio/x-raw ! audioconvert ! audioresample ! \
+             audio/x-raw,format=F32LE,layout=interleaved ! queue ! mux."
+        );
+        // The AAC knobs do not apply and must not leak in.
+        let branch = build_audio_branch(None, Some("ndi://x"), |key| {
+            (key == "BRAIDPIPE_AUDIO_ENCODER").then(|| "fdkaacenc".to_string())
+        })
+        .unwrap();
+        assert!(!branch.contains("fdkaacenc"));
+    }
+
+    #[test]
     fn audio_branch_env_overrides() {
-        let branch = build_audio_branch(None, |key| match key {
+        let branch = build_audio_branch(None, None, |key| match key {
             "BRAIDPIPE_AUDIO_ENCODER" => Some("fdkaacenc".into()),
             "BRAIDPIPE_AUDIO_BITRATE_KBPS" => Some("96".into()),
             _ => None,
@@ -563,7 +680,7 @@ mod tests {
         .unwrap();
         assert!(branch.contains("fdkaacenc bitrate=96000"));
 
-        let replaced = build_audio_branch(None, |key| {
+        let replaced = build_audio_branch(None, Some("ndi://x"), |key| {
             (key == "BRAIDPIPE_AUDIO_BRANCH").then(|| "decoder. ! fakesink".to_string())
         })
         .unwrap();

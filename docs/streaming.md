@@ -90,7 +90,9 @@ cargo run -p braidpipe --release -- \
   --preset lowlatency --output 'srt://0.0.0.0:8891?mode=listener'
 ```
 
-`--output` understands `rtmp://`, `srt://` and `udp://host:port`, and picks the right mux for each (FLV for RTMP, MPEG-TS for SRT/UDP). The daemon logs the sink it built at startup, so you can copy it out and use it as a `--sink` starting point.
+`--output` understands `rtmp://`, `srt://`, `udp://host:port` and `ndi://<name>`, and picks the right mux for each (FLV for RTMP, MPEG-TS for SRT/UDP, the NDI sink combiner for NDI). The daemon logs the sink it built at startup, so you can copy it out and use it as a `--sink` starting point.
+
+NDI is the odd one out: it carries raw frames and the NDI SDK compresses them itself, so none of the encoder settings below apply to an `ndi://` output — only the sink sync flag does. See the [NDI recipe](#recipe-ndi-1080p50-low-latency-high-quality).
 
 | Preset | Encoder settings | GOP | VBV | Sink sync | SRT latency | Intent |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -126,7 +128,41 @@ Verified end-to-end with the [latency harness](operations.md#measuring-latency):
 
 ### Recipe: NDI 1080p50, low latency, high quality
 
-When bandwidth is not a constraint and the goal is the lowest latency at the best picture, start from `lowlatency` and turn exactly two knobs:
+When bandwidth is not a constraint and the goal is the lowest latency at the best picture, stay on NDI end to end — the processed feed goes back onto the network as a new NDI source, and no H.264 encoder ever touches it:
+
+```bash
+cargo run -p braidpipe --release -- \
+  --uri 'ndi://Studio%20Camera' \
+  --width 1920 --height 1080 --fps 50 \
+  --audio --preset lowlatency \
+  --output 'ndi://Studio%20Camera%20AI'
+```
+
+The name after `ndi://` is what receivers (vMix, OBS, TriCaster, NDI Studio Monitor) see in their source list, percent-encoded the same way the input side addresses a camera. Under the hood this expands to `videoconvert ! video/x-raw,format=UYVY ! ndisinkcombiner name=mux ! ndisink sync=false ndi-name="Studio Camera AI"`, with audio joining the combiner as PCM. Why this is the right shape:
+
+- **No encoder, no encoder delay.** NDI takes raw UYVY frames and the SDK applies its own intra-frame SpeedHQ compression, so the bitrate, speed-preset, GOP and VBV knobs simply do not exist here. `--encoder` and `BRAIDPIPE_BITRATE_KBPS` are ignored for an `ndi://` output.
+- **`--preset lowlatency`** still matters for one thing: it sets `sync=false` on the sink, so frames leave the moment the relay hands them back rather than being held to the pipeline clock.
+- **`--audio`** stays uncompressed too — interleaved F32 PCM into the combiner's audio pad, which is the only layout it accepts. The AAC variables in [Audio passthrough](#audio-passthrough) do not apply.
+- **Bandwidth is the price.** Full-bandwidth NDI at 1080p50 runs around 150–200 Mbps per stream, so this recipe wants a wired gigabit LAN, ideally on its own VLAN. That is the trade the title promises: latency and quality, paid for in network.
+
+It needs the `ndi` plugin from gst-plugins-rs and the NDI runtime installed on the host — the Docker images do not ship either, so this recipe runs natively.
+
+To check the feed from GStreamer, receive it by the sender's address (NDI listens on TCP 5961 by default, with `5960` reserved for discovery; `lsof -nP -iTCP -sTCP:LISTEN -a -p <daemon pid>` shows the port the SDK actually picked):
+
+```bash
+gst-launch-1.0 ndisrc url-address=127.0.0.1:5961 ! ndisrcdemux name=d \
+  d.video ! queue ! videoconvert ! autovideosink sync=false \
+  d.audio ! queue ! audioconvert ! autoaudiosink
+```
+
+`ndi-name="HOST (Studio Camera AI)"` works instead of the address once discovery is fine on the receiving machine. If a receiver connects but never gets a frame — NDI Video Monitor shows the source but stays black, `ndisrc` logs only a metadata frame then times out — the NDI SDK's default reliable-UDP transport is being dropped somewhere between the two hosts (seen on macOS even over loopback). Force TCP in `~/.ndi/ndi-config.v1.json` on both ends and restart them:
+
+```json
+{ "ndi": { "rudp": { "send": { "enable": false }, "recv": { "enable": false } },
+           "tcp":  { "send": { "enable": true },  "recv": { "enable": true } } } }
+```
+
+If the output has to leave the LAN instead, keep the same source and swap the output for SRT — then the encoder is back in the path, and it is worth starting from `lowlatency` and turning exactly two knobs:
 
 ```bash
 BRAIDPIPE_BITRATE_KBPS=20000 BRAIDPIPE_SPEED_PRESET=fast \
@@ -226,6 +262,8 @@ Measured on a live SRT source (video + audio) relayed to RTMP at 720p30: steady-
 - **Source** — with `--uri` this is automatic. With a custom `--source`, name your demuxer or decodebin `decoder` so the audio branch can tap it.
 - **Sink** — with `--output` this is automatic (preset muxers are named). With a custom `--sink`, name your muxer `mux`.
 
+An `ndi://` output takes audio as PCM rather than AAC, because NDI carries it uncompressed: the branch becomes `… ! audioconvert ! audioresample ! audio/x-raw,format=F32LE,layout=interleaved ! queue ! mux.` and the encoder variables below are ignored.
+
 | Variable | Overrides | Default |
 | --- | --- | --- |
 | `BRAIDPIPE_AUDIO_ENCODER` | AAC encoder element | `avenc_aac` (in gst-libav; `fdkaacenc`, `faac` also work) |
@@ -241,7 +279,7 @@ If the source has no audio stream, don't pass `--audio` — the audio branch wou
 | `-i, --source <PIPELINE>` | test pattern | Explicit GStreamer source fragment |
 | `--uri <URI>` | — | Input URI decoded by GStreamer (`srt://`, `udp://`, `rtp://`, `ndi://`, `file://`), or a DeckLink capture card (`decklink://<device>?mode=…&connection=…`) |
 | `-o, --sink <PIPELINE>` | `videoconvert ! autovideosink` | Output fragment appended after the selector |
-| `--output <URL>` | — | Publish target (`rtmp://`, `srt://`, `udp://host:port`); builds the sink from `--preset` |
+| `--output <URL>` | — | Publish target (`rtmp://`, `srt://`, `udp://host:port`, `ndi://<name>`); builds the sink from `--preset` |
 | `--preset <NAME>` | `lowlatency` | Latency/bandwidth profile for `--output`, see [Output presets](#output-presets) |
 | `--hw <auto\|off>` | `auto` | GPU mode, see [GPU acceleration](#gpu-acceleration); `off` forces software decode and encode |
 | `--encoder <NAME>` | `auto` | Encoder for `--output`: `auto` picks the best hardware encoder, or pin `x264`, `vtenc`, `nvenc`, `va`, `vaapi`, `qsv`, `mf`, `amf` |
