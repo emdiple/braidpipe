@@ -28,11 +28,19 @@ cargo run -p braidpipe --release -- \
 
 `sync=false` is not incidental — it is worth about 48 ms, for the reasons in [Measuring latency](operations.md#measuring-latency).
 
-**NDI in**, with a plugin that registers the `ndi://` scheme:
+**NDI in**, via the `ndi://` pseudo-scheme:
 
 ```bash
-cargo run -p braidpipe --release -- --uri 'ndi://Studio%20Camera' --sink 'videoconvert ! autovideosink'
+cargo run -p braidpipe --release -- --uri 'ndi://STUDIO-PC%20(Camera%201)' --sink 'videoconvert ! autovideosink'
 ```
+
+`ndisrc` registers no GStreamer URI handler, so the daemon maps this scheme itself onto `ndisrc ndi-name="STUDIO-PC (Camera 1)" ! ndisrcdemux name=decoder`. The name is the full one receivers list — `MACHINE (source)`, percent-encoded — and it must match exactly: the machine part is whatever the sender's NDI runtime advertises, which on macOS includes the `.LOCAL` suffix (`EMDIPLES-MACBOOK-PRO.LOCAL (File Feed)`). A wrong name does not fail fast — `ndisrc` waits out its connect timeout and the pipeline dies with `EOS without available srcpad(s)` — so check the advertised name first:
+
+```bash
+dns-sd -B _ndi._tcp local        # macOS; avahi-browse -r _ndi._tcp on Linux
+```
+
+An optional `?url=host:port` skips discovery and connects straight to the sender (`ndisrc url-address`), which helps when mDNS does not cross the network. `--audio` taps the demuxer like any other source and needs no extra setup. Needs the `ndi` plugin from gst-plugins-rs and the NDI runtime.
 
 **A Blackmagic DeckLink capture card** (SDI/HDMI), via the `decklink://` pseudo-scheme:
 
@@ -132,7 +140,7 @@ When bandwidth is not a constraint and the goal is the lowest latency at the bes
 
 ```bash
 cargo run -p braidpipe --release -- \
-  --uri 'ndi://Studio%20Camera' \
+  --uri 'ndi://STUDIO-PC%20(Studio%20Camera)' \
   --width 1920 --height 1080 --fps 50 \
   --audio --preset lowlatency \
   --output 'ndi://Studio%20Camera%20AI'
@@ -147,27 +155,22 @@ The name after `ndi://` is what receivers (vMix, OBS, TriCaster, NDI Studio Moni
 
 It needs the `ndi` plugin from gst-plugins-rs and the NDI runtime installed on the host — the Docker images do not ship either, so this recipe runs natively.
 
-To check the feed from GStreamer, receive it by the sender's address (NDI listens on TCP 5961 by default, with `5960` reserved for discovery; `lsof -nP -iTCP -sTCP:LISTEN -a -p <daemon pid>` shows the port the SDK actually picked):
+To check the feed from GStreamer, receive it by its advertised name — the sending machine's NDI name plus the `--output` name in parentheses:
 
 ```bash
-gst-launch-1.0 ndisrc url-address=127.0.0.1:5961 ! ndisrcdemux name=d \
+gst-launch-1.0 ndisrc ndi-name="STUDIO-PC.LOCAL (Studio Camera AI)" ! ndisrcdemux name=d \
   d.video ! queue ! videoconvert ! autovideosink sync=false \
   d.audio ! queue ! audioconvert ! autoaudiosink
 ```
 
-`ndi-name="HOST (Studio Camera AI)"` works instead of the address once discovery is fine on the receiving machine. If a receiver connects but never gets a frame — NDI Video Monitor shows the source but stays black, `ndisrc` logs only a metadata frame then times out — the NDI SDK's default reliable-UDP transport is being dropped somewhere between the two hosts (seen on macOS even over loopback). Force TCP in `~/.ndi/ndi-config.v1.json` on both ends and restart them:
-
-```json
-{ "ndi": { "rudp": { "send": { "enable": false }, "recv": { "enable": false } },
-           "tcp":  { "send": { "enable": true },  "recv": { "enable": true } } } }
-```
+The name must match what `dns-sd -B _ndi._tcp local` (or `avahi-browse -r _ndi._tcp`) lists, `.LOCAL` suffix included where the runtime adds one. A near-miss does not fail fast: `ndisrc` waits out its connect timeout and then the demuxer errors with `EOS without available srcpad(s)`. If discovery does not reach the receiving machine at all, `url-address=host:port` in place of `ndi-name` connects directly (`lsof -nP -iTCP -sTCP:LISTEN -a -p <daemon pid>` shows the port the SDK picked).
 
 If the output has to leave the LAN instead, keep the same source and swap the output for SRT — then the encoder is back in the path, and it is worth starting from `lowlatency` and turning exactly two knobs:
 
 ```bash
 BRAIDPIPE_BITRATE_KBPS=20000 BRAIDPIPE_SPEED_PRESET=fast \
 cargo run -p braidpipe --release -- \
-  --uri 'ndi://Studio%20Camera' \
+  --uri 'ndi://STUDIO-PC%20(Studio%20Camera)' \
   --width 1920 --height 1080 --fps 50 \
   --preset lowlatency --encoder auto \
   --output 'srt://0.0.0.0:8891?mode=listener'
@@ -277,7 +280,7 @@ If the source has no audio stream, don't pass `--audio` — the audio branch wou
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `-i, --source <PIPELINE>` | test pattern | Explicit GStreamer source fragment |
-| `--uri <URI>` | — | Input URI decoded by GStreamer (`srt://`, `udp://`, `rtp://`, `ndi://`, `file://`), or a DeckLink capture card (`decklink://<device>?mode=…&connection=…`) |
+| `--uri <URI>` | — | Input URI decoded by GStreamer (`srt://`, `udp://`, `rtp://`, `file://`), an NDI source (`ndi://<MACHINE%20(name)>[?url=host:port]`), or a DeckLink capture card (`decklink://<device>?mode=…&connection=…`) |
 | `-o, --sink <PIPELINE>` | `videoconvert ! autovideosink` | Output fragment appended after the selector |
 | `--output <URL>` | — | Publish target (`rtmp://`, `srt://`, `udp://host:port`, `ndi://<name>`); builds the sink from `--preset` |
 | `--preset <NAME>` | `lowlatency` | Latency/bandwidth profile for `--output`, see [Output presets](#output-presets) |

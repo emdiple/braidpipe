@@ -422,6 +422,10 @@ impl GStreamerEngine {
             return Ok(decklink?.video_source());
         }
 
+        if let Some(ndi) = NdiInput::parse(uri) {
+            return Ok(ndi?.video_source());
+        }
+
         if uri
             .get(..6)
             .is_some_and(|scheme| scheme.eq_ignore_ascii_case("srt://"))
@@ -452,6 +456,95 @@ impl GStreamerEngine {
             .downcast::<AppSrc>()
             .map_err(|_| EngineError::BuildFailed("Invalid AppSrc".into()))
     }
+}
+
+/// The `ndi://` pseudo-scheme for NDI sources: `ndi://<name>[?url=<host:port>]`,
+/// with the name percent-encoded, e.g. `ndi://STUDIO-PC%20(Camera%201)`.
+/// `ndisrc` registers no GStreamer URI handler, so the daemon maps the scheme
+/// itself onto `ndisrc ! ndisrcdemux`, with the demuxer named `decoder` so the
+/// generated audio branch can tap it like any other demuxer. The name is the
+/// full one receivers list, `MACHINE (source)`; `url` skips discovery and
+/// connects straight to the sender's address (`ndisrc url-address`).
+pub struct NdiInput {
+    name: String,
+    url_address: Option<String>,
+}
+
+impl NdiInput {
+    /// `Some` iff `uri` uses the ndi:// scheme; the inner `Err` is a
+    /// malformed ndi URI.
+    pub fn parse(uri: &str) -> Option<Result<Self, EngineError>> {
+        uri.get(..6)
+            .filter(|scheme| scheme.eq_ignore_ascii_case("ndi://"))
+            .map(|_| Self::parse_rest(&uri[6..]))
+    }
+
+    fn parse_rest(rest: &str) -> Result<Self, EngineError> {
+        let (encoded, query) = rest.split_once('?').unwrap_or((rest, ""));
+        let name = percent_decode(encoded).ok_or_else(|| {
+            EngineError::BuildFailed(format!("ndi source name has a malformed percent-escape: '{encoded}'"))
+        })?;
+        if name.trim().is_empty() {
+            return Err(EngineError::BuildFailed(
+                "ndi input must name the source: ndi://<name>, e.g. ndi://STUDIO-PC%20(Camera%201)".into(),
+            ));
+        }
+
+        let mut url_address = None;
+        for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            if key != "url" {
+                return Err(EngineError::BuildFailed(format!(
+                    "unknown ndi parameter '{key}' (supported: url)"
+                )));
+            }
+            if value.is_empty() || !value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-' | '[' | ']')) {
+                return Err(EngineError::BuildFailed(format!(
+                    "invalid ndi url '{value}' (expected host:port)"
+                )));
+            }
+            url_address = Some(value.to_string());
+        }
+
+        Ok(Self { name, url_address })
+    }
+
+    fn video_source(&self) -> String {
+        let url = self
+            .url_address
+            .as_ref()
+            .map(|u| format!(" url-address={u}"))
+            .unwrap_or_default();
+        format!(
+            "ndisrc ndi-name={}{url} ! ndisrcdemux name=decoder decoder. ! queue ! video/x-raw ! videoconvert ! videoscale",
+            quote_launch(&self.name)
+        )
+    }
+}
+
+/// Decodes `%XX` escapes; `None` on a truncated or non-hex escape or if the
+/// result is not UTF-8.
+fn percent_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = s.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Quotes a property value for gst-launch syntax.
+fn quote_launch(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 /// The `decklink://` pseudo-scheme for Blackmagic capture cards:
@@ -628,7 +721,7 @@ mod tests {
 
     #[test]
     fn creates_a_uri_decoder_pipeline_for_non_srt_uris() {
-        let pipeline = GStreamerEngine::uri_source_pipeline("ndi://Studio%20Camera")
+        let pipeline = GStreamerEngine::uri_source_pipeline("udp://127.0.0.1:5000")
             .expect("valid URI should build a source pipeline");
 
         assert!(pipeline.contains("uridecodebin3"));
@@ -661,6 +754,27 @@ mod tests {
         assert!(GStreamerEngine::uri_source_pipeline("decklink://0?gain=3").is_err());
         assert!(GStreamerEngine::uri_source_pipeline("decklink://0?mode=10 80p50").is_err());
         assert!(GStreamerEngine::uri_source_pipeline("decklink://zero").is_err());
+    }
+
+    #[test]
+    fn maps_ndi_uris_onto_ndisrc_with_a_tappable_demuxer() {
+        let pipeline = GStreamerEngine::uri_source_pipeline("ndi://STUDIO-PC%20(Camera%201)")
+            .expect("valid ndi URI should build a source pipeline");
+        assert_eq!(
+            pipeline,
+            "ndisrc ndi-name=\"STUDIO-PC (Camera 1)\" ! ndisrcdemux name=decoder decoder. ! queue ! video/x-raw ! videoconvert ! videoscale"
+        );
+
+        let direct = GStreamerEngine::uri_source_pipeline("ndi://Cam?url=192.168.1.20:5961").unwrap();
+        assert!(direct.contains("ndisrc ndi-name=\"Cam\" url-address=192.168.1.20:5961 !"));
+    }
+
+    #[test]
+    fn rejects_malformed_ndi_uris() {
+        assert!(GStreamerEngine::uri_source_pipeline("ndi://").is_err());
+        assert!(GStreamerEngine::uri_source_pipeline("ndi://Cam%2").is_err());
+        assert!(GStreamerEngine::uri_source_pipeline("ndi://Cam?bandwidth=low").is_err());
+        assert!(GStreamerEngine::uri_source_pipeline("ndi://Cam?url=host port").is_err());
     }
 
     #[test]
