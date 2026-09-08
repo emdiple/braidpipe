@@ -107,8 +107,7 @@ async fn relay_loop(
                 bridge.record_success();
                 metrics::FRAMES_AI.inc();
                 metrics::ROUNDTRIP_SECONDS.observe_seconds(started.elapsed().as_secs_f64());
-                metrics::WORKER_PROCESSING_SECONDS
-                    .observe_seconds(processing_us as f64 / 1e6);
+                metrics::WORKER_PROCESSING_SECONDS.observe_seconds(processing_us as f64 / 1e6);
                 metrics::LAST_AI_FRAME_TIMESTAMP.set(metrics::unix_now());
             }
             Err(error) => {

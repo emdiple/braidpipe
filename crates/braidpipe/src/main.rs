@@ -238,8 +238,7 @@ async fn run() -> Result<(), AppError> {
     // 4. Bind the Unix Domain Socket Signaling Adapter
     info!("Binding UDS control channels...");
     let ai_bridge = Arc::new(
-        UdsControlBridge::bind(&args.rust_sock, &args.python_sock, Arc::clone(&shm_buffer))
-            .await?,
+        UdsControlBridge::bind(&args.rust_sock, &args.python_sock, Arc::clone(&shm_buffer)).await?,
     );
 
     // Optionally open the same negotiation to workers on other machines

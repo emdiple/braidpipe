@@ -151,7 +151,11 @@ impl ShmRingBuffer {
                 );
             }
 
-            info!(fd, bytes = total_size, "Created anonymous shared-memory ring buffer");
+            info!(
+                fd,
+                bytes = total_size,
+                "Created anonymous shared-memory ring buffer"
+            );
 
             Ok(Self {
                 fd,
@@ -379,7 +383,8 @@ mod tests {
 
         let expected = std::mem::size_of::<ShmHeader>()
             + slots as usize
-                * (std::mem::size_of::<SlotHeader>() + (width * height * u32::from(channels)) as usize);
+                * (std::mem::size_of::<SlotHeader>()
+                    + (width * height * u32::from(channels)) as usize);
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         assert_eq!(unsafe { libc::fstat(shm.fd(), &mut stat) }, 0);
         // macOS rounds segments up to the page size; the fd must cover at

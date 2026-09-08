@@ -179,8 +179,13 @@ fn handshake(socket: &UnixDatagram, rust_sock: &str) -> io::Result<RawFd> {
             // A frame notification that raced the handshake, or a timeout:
             // either way, ask again.
             Ok((_, None)) => continue,
-            Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                continue
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
             }
             Err(error) => return Err(error),
         }

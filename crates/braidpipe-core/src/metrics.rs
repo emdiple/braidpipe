@@ -244,41 +244,104 @@ pub fn render(out: &mut String) {
         };
     }
 
-    gauge!("braidpipe_up", "1 while the daemon is streaming, 0 once it starts shutting down", UP.get());
+    gauge!(
+        "braidpipe_up",
+        "1 while the daemon is streaming, 0 once it starts shutting down",
+        UP.get()
+    );
 
     counter!("braidpipe_frames_total", "Frames pushed downstream by the relay, by outcome",
         "{outcome=\"ai\"}" => FRAMES_AI, "{outcome=\"passthrough\"}" => FRAMES_PASSTHROUGH);
     ROUNDTRIP_SECONDS.render(out, "braidpipe_roundtrip_seconds");
     WORKER_PROCESSING_SECONDS.render(out, "braidpipe_worker_processing_seconds");
-    gauge!("braidpipe_relay_deadline_seconds", "Per-frame budget for the AI roundtrip", RELAY_DEADLINE_SECONDS.get());
-    gauge!("braidpipe_last_ai_frame_timestamp_seconds", "Unix time of the last successful AI frame", LAST_AI_FRAME_TIMESTAMP.get());
+    gauge!(
+        "braidpipe_relay_deadline_seconds",
+        "Per-frame budget for the AI roundtrip",
+        RELAY_DEADLINE_SECONDS.get()
+    );
+    gauge!(
+        "braidpipe_last_ai_frame_timestamp_seconds",
+        "Unix time of the last successful AI frame",
+        LAST_AI_FRAME_TIMESTAMP.get()
+    );
     counter!("braidpipe_stale_acks_total", "Acks for frames that had already timed out", "" => STALE_ACKS);
     counter!("braidpipe_relay_channel_drops_total", "Frames dropped because the relay was still busy", "" => RELAY_CHANNEL_DROPS);
     counter!("braidpipe_shm_full_total", "Frames dropped because no SHM slot was free", "" => SHM_FULL);
 
-    gauge!("braidpipe_failure_streak", "Consecutive failed roundtrips", FAILURE_STREAK.get());
-    gauge!("braidpipe_worker_healthy", "1 while the worker is considered healthy", WORKER_HEALTHY.get());
-    gauge!("braidpipe_active_branch", "1 while the AI branch is selected", ACTIVE_BRANCH.get());
+    gauge!(
+        "braidpipe_failure_streak",
+        "Consecutive failed roundtrips",
+        FAILURE_STREAK.get()
+    );
+    gauge!(
+        "braidpipe_worker_healthy",
+        "1 while the worker is considered healthy",
+        WORKER_HEALTHY.get()
+    );
+    gauge!(
+        "braidpipe_active_branch",
+        "1 while the AI branch is selected",
+        ACTIVE_BRANCH.get()
+    );
     counter!("braidpipe_branch_switches_total", "Selector switches, by direction",
         "{direction=\"to_ai\"}" => BRANCH_SWITCHES_TO_AI,
         "{direction=\"to_passthrough\"}" => BRANCH_SWITCHES_TO_PASSTHROUGH);
-    let _ = writeln!(out, "# HELP braidpipe_branch_seconds_total Stream time spent on each branch");
+    let _ = writeln!(
+        out,
+        "# HELP braidpipe_branch_seconds_total Stream time spent on each branch"
+    );
     let _ = writeln!(out, "# TYPE braidpipe_branch_seconds_total counter");
-    let _ = writeln!(out, "braidpipe_branch_seconds_total{{branch=\"ai\"}} {}", BRANCH_SECONDS_AI.seconds());
-    let _ = writeln!(out, "braidpipe_branch_seconds_total{{branch=\"passthrough\"}} {}", BRANCH_SECONDS_PASSTHROUGH.seconds());
+    let _ = writeln!(
+        out,
+        "braidpipe_branch_seconds_total{{branch=\"ai\"}} {}",
+        BRANCH_SECONDS_AI.seconds()
+    );
+    let _ = writeln!(
+        out,
+        "braidpipe_branch_seconds_total{{branch=\"passthrough\"}} {}",
+        BRANCH_SECONDS_PASSTHROUGH.seconds()
+    );
 
-    gauge!("braidpipe_worker_up", "1 while the worker is running (managed) or recently delivering frames (external)", WORKER_UP.get());
+    gauge!(
+        "braidpipe_worker_up",
+        "1 while the worker is running (managed) or recently delivering frames (external)",
+        WORKER_UP.get()
+    );
     counter!("braidpipe_worker_exits_total", "Times the worker process has exited", "" => WORKER_EXITS);
-    gauge!("braidpipe_worker_last_exit_code", "Exit code of the most recent worker exit", WORKER_LAST_EXIT_CODE.get());
-    gauge!("braidpipe_worker_cpu_seconds_total", "Cumulative CPU time of the worker process", WORKER_CPU_SECONDS.get());
-    gauge!("braidpipe_worker_resident_memory_bytes", "Resident memory of the worker process", WORKER_RSS_BYTES.get());
+    gauge!(
+        "braidpipe_worker_last_exit_code",
+        "Exit code of the most recent worker exit",
+        WORKER_LAST_EXIT_CODE.get()
+    );
+    gauge!(
+        "braidpipe_worker_cpu_seconds_total",
+        "Cumulative CPU time of the worker process",
+        WORKER_CPU_SECONDS.get()
+    );
+    gauge!(
+        "braidpipe_worker_resident_memory_bytes",
+        "Resident memory of the worker process",
+        WORKER_RSS_BYTES.get()
+    );
 
     counter!("braidpipe_input_frames_total", "Frames arriving from the source", "" => INPUT_FRAMES);
     INPUT_INTERVAL_SECONDS.render(out, "braidpipe_input_interval_seconds");
     counter!("braidpipe_pts_discontinuities_total", "Input timestamps that went backwards or gapped", "" => PTS_DISCONTINUITIES);
-    gauge!("braidpipe_input_width", "Negotiated input width", INPUT_WIDTH.get());
-    gauge!("braidpipe_input_height", "Negotiated input height", INPUT_HEIGHT.get());
-    gauge!("braidpipe_input_fps", "Negotiated input frame rate", INPUT_FPS.get());
+    gauge!(
+        "braidpipe_input_width",
+        "Negotiated input width",
+        INPUT_WIDTH.get()
+    );
+    gauge!(
+        "braidpipe_input_height",
+        "Negotiated input height",
+        INPUT_HEIGHT.get()
+    );
+    gauge!(
+        "braidpipe_input_fps",
+        "Negotiated input frame rate",
+        INPUT_FPS.get()
+    );
     counter!("braidpipe_output_frames_total", "Frames leaving the selector toward the sink", "" => OUTPUT_FRAMES);
     counter!("braidpipe_sink_bytes_total", "Bytes handed to the final sink", "" => SINK_BYTES);
     counter!("braidpipe_sink_buffers_total", "Buffers handed to the final sink", "" => SINK_BUFFERS);
@@ -293,22 +356,42 @@ pub fn render(out: &mut String) {
         LAST_AUDIO_PTS_US.load(Ordering::Relaxed),
     );
     if v >= 0 && a >= 0 {
-        gauge!("braidpipe_av_skew_seconds", "Video minus audio PTS at the muxer", (v - a) as f64 / 1e6);
+        gauge!(
+            "braidpipe_av_skew_seconds",
+            "Video minus audio PTS at the muxer",
+            (v - a) as f64 / 1e6
+        );
     }
 
     // GPU series appear only where the platform can actually measure them:
     // an absent series is honest, a fake zero looks like an idle GPU.
     if GPU_UTILIZATION.get() >= 0 {
-        gauge!("braidpipe_gpu_utilization_percent", "Machine-wide GPU utilization", GPU_UTILIZATION.get());
+        gauge!(
+            "braidpipe_gpu_utilization_percent",
+            "Machine-wide GPU utilization",
+            GPU_UTILIZATION.get()
+        );
     }
     if GPU_ENCODER_UTILIZATION.get() >= 0 {
-        gauge!("braidpipe_gpu_encoder_utilization_percent", "Hardware video encoder (NVENC) utilization", GPU_ENCODER_UTILIZATION.get());
+        gauge!(
+            "braidpipe_gpu_encoder_utilization_percent",
+            "Hardware video encoder (NVENC) utilization",
+            GPU_ENCODER_UTILIZATION.get()
+        );
     }
     if GPU_DECODER_UTILIZATION.get() >= 0 {
-        gauge!("braidpipe_gpu_decoder_utilization_percent", "Hardware video decoder (NVDEC) utilization", GPU_DECODER_UTILIZATION.get());
+        gauge!(
+            "braidpipe_gpu_decoder_utilization_percent",
+            "Hardware video decoder (NVDEC) utilization",
+            GPU_DECODER_UTILIZATION.get()
+        );
     }
     if GPU_MEMORY_USED_BYTES.get() >= 0 {
-        gauge!("braidpipe_gpu_memory_used_bytes", "GPU memory in use, machine-wide", GPU_MEMORY_USED_BYTES.get());
+        gauge!(
+            "braidpipe_gpu_memory_used_bytes",
+            "GPU memory in use, machine-wide",
+            GPU_MEMORY_USED_BYTES.get()
+        );
     }
 }
 

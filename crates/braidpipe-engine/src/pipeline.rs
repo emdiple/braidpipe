@@ -146,10 +146,7 @@ impl GStreamerEngine {
     ) {
         // Input side: every frame the source delivers, its arrival jitter,
         // timestamp sanity, and the negotiated caps.
-        if let Some(pad) = pipeline
-            .by_name("t")
-            .and_then(|tee| tee.static_pad("sink"))
-        {
+        if let Some(pad) = pipeline.by_name("t").and_then(|tee| tee.static_pad("sink")) {
             let state: Mutex<(Option<Instant>, Option<gstreamer::ClockTime>)> =
                 Mutex::new((None, None));
             pad.add_probe(
@@ -170,8 +167,7 @@ impl GStreamerEngine {
                                     // discontinuity once the gap passes 1.75x
                                     // the frame duration (when known).
                                     let gapped = buffer.duration().is_some_and(|d| {
-                                        pts.nseconds()
-                                            > last.nseconds() + d.nseconds() * 7 / 4
+                                        pts.nseconds() > last.nseconds() + d.nseconds() * 7 / 4
                                     });
                                     if pts < last || gapped {
                                         metrics::PTS_DISCONTINUITIES.inc();
@@ -223,16 +219,17 @@ impl GStreamerEngine {
             // Keyframe cadence, at the encoder's output where the DELTA_UNIT
             // flag is authoritative (post-mux, audio tags would pollute it).
             if VIDEO_ENCODER_FACTORIES.contains(&factory.as_str())
-                && let Some(pad) = element.static_pad("src") {
-                    pad.add_probe(gstreamer::PadProbeType::BUFFER, |_, info| {
-                        if let Some(gstreamer::PadProbeData::Buffer(buffer)) = &info.data
-                            && !buffer.flags().contains(gstreamer::BufferFlags::DELTA_UNIT)
-                        {
-                            metrics::KEYFRAMES.inc();
-                        }
-                        gstreamer::PadProbeReturn::Ok
-                    });
-                }
+                && let Some(pad) = element.static_pad("src")
+            {
+                pad.add_probe(gstreamer::PadProbeType::BUFFER, |_, info| {
+                    if let Some(gstreamer::PadProbeData::Buffer(buffer)) = &info.data
+                        && !buffer.flags().contains(gstreamer::BufferFlags::DELTA_UNIT)
+                    {
+                        metrics::KEYFRAMES.inc();
+                    }
+                    gstreamer::PadProbeReturn::Ok
+                });
+            }
 
             if factory == "srtsink" || factory == "srtsrc" {
                 srt_elements.push(element.clone());
@@ -328,17 +325,17 @@ impl GStreamerEngine {
             let mut k = kind.load(Ordering::Relaxed);
             if k == 0
                 && let Some(caps) = pad.current_caps()
-                    && let Some(s) = caps.structure(0)
-                {
-                    k = if s.name().starts_with("video/") {
-                        1
-                    } else if s.name().starts_with("audio/") {
-                        2
-                    } else {
-                        3
-                    };
-                    kind.store(k, Ordering::Relaxed);
-                }
+                && let Some(s) = caps.structure(0)
+            {
+                k = if s.name().starts_with("video/") {
+                    1
+                } else if s.name().starts_with("audio/") {
+                    2
+                } else {
+                    3
+                };
+                kind.store(k, Ordering::Relaxed);
+            }
             // Raw PTS at a muxer is not comparable across pads: video
             // encoders shift timestamps by a large constant (1000 hours) to
             // keep DTS non-negative. Running time through the pad's segment
@@ -492,11 +489,14 @@ impl NdiInput {
     fn parse_rest(rest: &str) -> Result<Self, EngineError> {
         let (encoded, query) = rest.split_once('?').unwrap_or((rest, ""));
         let name = percent_decode(encoded).ok_or_else(|| {
-            EngineError::BuildFailed(format!("ndi source name has a malformed percent-escape: '{encoded}'"))
+            EngineError::BuildFailed(format!(
+                "ndi source name has a malformed percent-escape: '{encoded}'"
+            ))
         })?;
         if name.trim().is_empty() {
             return Err(EngineError::BuildFailed(
-                "ndi input must name the source: ndi://<name>, e.g. ndi://STUDIO-PC%20(Camera%201)".into(),
+                "ndi input must name the source: ndi://<name>, e.g. ndi://STUDIO-PC%20(Camera%201)"
+                    .into(),
             ));
         }
 
@@ -511,9 +511,9 @@ impl NdiInput {
             match key {
                 "url" => {
                     if value.is_empty()
-                        || !value
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-' | '[' | ']'))
+                        || !value.chars().all(|c| {
+                            c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-' | '[' | ']')
+                        })
                     {
                         return Err(EngineError::BuildFailed(format!(
                             "invalid ndi url '{value}' (expected host:port)"
@@ -802,14 +802,18 @@ mod tests {
             "ndisrc ndi-name=\"STUDIO-PC (Camera 1)\" connect-timeout=0 timeout=0 ! ndisrcdemux name=decoder decoder. ! queue ! video/x-raw ! videoconvert ! videoscale"
         );
 
-        let direct = GStreamerEngine::uri_source_pipeline("ndi://Cam?url=192.168.1.20:5961").unwrap();
-        assert!(direct.contains("ndisrc ndi-name=\"Cam\" url-address=192.168.1.20:5961 connect-timeout=0 timeout=0 !"));
+        let direct =
+            GStreamerEngine::uri_source_pipeline("ndi://Cam?url=192.168.1.20:5961").unwrap();
+        assert!(direct.contains(
+            "ndisrc ndi-name=\"Cam\" url-address=192.168.1.20:5961 connect-timeout=0 timeout=0 !"
+        ));
     }
 
     #[test]
     fn ndi_waits_forever_unless_told_otherwise() {
         let fail_fast =
-            GStreamerEngine::uri_source_pipeline("ndi://Cam?connect-timeout=10000&timeout=5000").unwrap();
+            GStreamerEngine::uri_source_pipeline("ndi://Cam?connect-timeout=10000&timeout=5000")
+                .unwrap();
         assert!(fail_fast.contains(" connect-timeout=10000 timeout=5000 !"));
         assert!(GStreamerEngine::uri_source_pipeline("ndi://Cam?timeout=soon").is_err());
         assert!(GStreamerEngine::uri_source_pipeline("ndi://Cam?timeout=-1").is_err());

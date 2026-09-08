@@ -340,7 +340,10 @@ pub async fn drain(port: u16, drain_ms: u64) {
     if port == 0 || drain_ms == 0 {
         return;
     }
-    info!(drain_ms, "Holding the metrics endpoint open so the final state is scraped");
+    info!(
+        drain_ms,
+        "Holding the metrics endpoint open so the final state is scraped"
+    );
     tokio::time::sleep(Duration::from_millis(drain_ms)).await;
 }
 
@@ -357,7 +360,10 @@ pub fn spawn_shutdown_guard(deadline_ms: u64) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(deadline_ms)).await;
-        warn!(deadline_ms, "Shutdown did not complete in time; forcing exit");
+        warn!(
+            deadline_ms,
+            "Shutdown did not complete in time; forcing exit"
+        );
         std::process::exit(0);
     });
 }
@@ -428,7 +434,10 @@ mod tests {
 
     #[test]
     fn nvidia_csv_first_gpu_wins() {
-        assert_eq!(parse_nvidia_csv("12, 34, 5, 1234\n"), Some((12, 34, 5, 1234)));
+        assert_eq!(
+            parse_nvidia_csv("12, 34, 5, 1234\n"),
+            Some((12, 34, 5, 1234))
+        );
         assert_eq!(
             parse_nvidia_csv("7, 0, 0, 512\n90, 90, 90, 9999\n"),
             Some((7, 0, 0, 512))

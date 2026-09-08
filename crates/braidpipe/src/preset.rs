@@ -229,10 +229,7 @@ pub fn build_sink(
 
 /// Applies environment overrides on top of a preset's defaults. The lookup is
 /// injected so tests do not have to mutate process-global state.
-fn resolve(
-    preset: &str,
-    env: impl Fn(&str) -> Option<String>,
-) -> Result<Params, String> {
+fn resolve(preset: &str, env: impl Fn(&str) -> Option<String>) -> Result<Params, String> {
     let mut p = defaults(preset).ok_or_else(|| {
         format!(
             "unknown preset '{preset}' (expected one of: {})",
@@ -301,7 +298,11 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
 
     let encoder = match p.encoder {
         Encoder::X264 => {
-            let tune = if p.zerolatency { " tune=zerolatency" } else { "" };
+            let tune = if p.zerolatency {
+                " tune=zerolatency"
+            } else {
+                ""
+            };
             format!(
                 "x264enc speed-preset={}{tune} bitrate={} key-int-max={keyint} \
                  vbv-buf-capacity={}",
@@ -338,7 +339,11 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
              vbv-buffer-size={}{} ! video/x-h264,profile=high",
             p.bitrate_kbps,
             if p.zerolatency { "cbr-ld-hq" } else { "cbr" },
-            if p.zerolatency { "low-latency-hq" } else { "hq" },
+            if p.zerolatency {
+                "low-latency-hq"
+            } else {
+                "hq"
+            },
             p.bitrate_kbps * p.vbv_buf_ms / 1000,
             if p.zerolatency {
                 " b-adapt=false bframes=0 zerolatency=true"
@@ -367,7 +372,11 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
         Encoder::Amf => format!(
             "amfh264enc bitrate={} gop-size={keyint} usage={}",
             p.bitrate_kbps,
-            if p.zerolatency { "ultra-low-latency" } else { "transcoding" }
+            if p.zerolatency {
+                "ultra-low-latency"
+            } else {
+                "transcoding"
+            }
         ),
     };
 
@@ -410,7 +419,11 @@ fn render(p: &Params, output: &str, fps: u32) -> Result<String, String> {
     // samples for no benefit over these transports. x264 gets its native
     // planar I420; the hardware encoders are NV12-native (biplanar), which
     // spares them an internal repack per frame. Same chroma either way.
-    let raw_format = if p.encoder == Encoder::X264 { "I420" } else { "NV12" };
+    let raw_format = if p.encoder == Encoder::X264 {
+        "I420"
+    } else {
+        "NV12"
+    };
     Ok(format!(
         "videoconvert ! video/x-raw,format={raw_format} ! {encoder} ! \
          h264parse config-interval=-1 ! {mux_and_sink}"
@@ -427,7 +440,9 @@ fn ndi_source_name(output: &str) -> Result<Option<String>, String> {
     let name = percent_decode(encoded)
         .ok_or_else(|| format!("ndi output has a malformed percent-escape: '{output}'"))?;
     if name.trim().is_empty() {
-        return Err(format!("ndi output must name the source: ndi://<name>, got '{output}'"));
+        return Err(format!(
+            "ndi output must name the source: ndi://<name>, got '{output}'"
+        ));
     }
     Ok(Some(name))
 }
@@ -514,7 +529,9 @@ fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
     match value {
         "1" | "true" | "yes" => Ok(true),
         "0" | "false" | "no" => Ok(false),
-        _ => Err(format!("{key} must be a boolean (1/0/true/false), got '{value}'")),
+        _ => Err(format!(
+            "{key} must be a boolean (1/0/true/false), got '{value}'"
+        )),
     }
 }
 
@@ -621,7 +638,11 @@ mod tests {
         assert!(!sink.contains("enc"));
 
         let p = resolve("bandwidth", no_env).unwrap();
-        assert!(render(&p, "ndi://plain", 30).unwrap().contains("sync=true ndi-name=\"plain\""));
+        assert!(
+            render(&p, "ndi://plain", 30)
+                .unwrap()
+                .contains("sync=true ndi-name=\"plain\"")
+        );
 
         assert!(render(&p, "ndi://", 30).is_err());
         assert!(render(&p, "ndi://%2", 30).is_err());
@@ -631,7 +652,10 @@ mod tests {
     #[test]
     fn ndi_name_quoting_survives_the_launch_parser() {
         assert_eq!(quote_launch("a \"b\" \\c"), "\"a \\\"b\\\" \\\\c\"");
-        assert_eq!(percent_decode("Caf%C3%A9%20%22x%22").as_deref(), Some("Café \"x\""));
+        assert_eq!(
+            percent_decode("Caf%C3%A9%20%22x%22").as_deref(),
+            Some("Café \"x\"")
+        );
     }
 
     #[test]
@@ -717,10 +741,14 @@ mod tests {
         assert!(va.contains("vah264enc bitrate=4500 key-int-max=60 target-usage=6 cpb-size=900"));
 
         assert!(with_encoder("vaapi").contains("vaapih264enc bitrate=4500 keyframe-period=60"));
-        assert!(with_encoder("qsv").contains("qsvh264enc bitrate=4500 gop-size=60 low-latency=true"));
+        assert!(
+            with_encoder("qsv").contains("qsvh264enc bitrate=4500 gop-size=60 low-latency=true")
+        );
         assert!(with_encoder("mf").contains("mfh264enc bitrate=4500 gop-size=60 low-latency=true"));
-        assert!(with_encoder("amf")
-            .contains("amfh264enc bitrate=4500 gop-size=60 usage=ultra-low-latency"));
+        assert!(
+            with_encoder("amf")
+                .contains("amfh264enc bitrate=4500 gop-size=60 usage=ultra-low-latency")
+        );
     }
 
     #[test]
@@ -752,12 +780,16 @@ mod tests {
 
     #[test]
     fn unknown_preset_and_bad_env_are_reported() {
-        assert!(resolve("warpspeed", no_env)
-            .unwrap_err()
-            .contains("zerolatency, lowlatency, balanced, bandwidth"));
-        assert!(resolve("lowlatency", |key| {
-            (key == "BRAIDPIPE_ZEROLATENCY").then(|| "maybe".to_string())
-        })
-        .is_err());
+        assert!(
+            resolve("warpspeed", no_env)
+                .unwrap_err()
+                .contains("zerolatency, lowlatency, balanced, bandwidth")
+        );
+        assert!(
+            resolve("lowlatency", |key| {
+                (key == "BRAIDPIPE_ZEROLATENCY").then(|| "maybe".to_string())
+            })
+            .is_err()
+        );
     }
 }
