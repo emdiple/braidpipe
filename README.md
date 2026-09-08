@@ -124,7 +124,7 @@ docker compose up --build
 ffplay -fflags nobuffer 'srt://127.0.0.1:8891?latency=200'   # the edge-transformed feed
 ```
 
-On a Linux host with an NVIDIA GPU, the GPU overlay moves decode and encode onto the card (NVDEC + `nvh264enc`); prerequisites and the VA-API alternative are in [streaming.md](docs/streaming.md#in-docker):
+On a Linux host with an NVIDIA GPU, the GPU overlay hands the container the card so decode and encode run on it (NVDEC + `nvh264enc`) — the same image, granted a GPU. Prerequisites and the VA-API alternative are in [streaming.md](docs/streaming.md#in-docker):
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build -d
